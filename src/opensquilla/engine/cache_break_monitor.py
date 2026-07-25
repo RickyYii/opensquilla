@@ -4,11 +4,18 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
 from opensquilla.provider import ChatConfig, Message, ToolDefinition
+
+# Backstop cap on per-session baselines held in memory. Sessions normally leave
+# through SessionManager.finish -> evict; this bound only catches the ones that
+# never reach a terminal status (crashes, abandoned channel chats, entry points
+# that never call finish).
+_MAX_TRACKED_SESSIONS = 512
 
 
 def _jsonable(value: Any) -> Any:
@@ -149,13 +156,39 @@ class _CacheBaseline:
 
 
 class CacheBreakMonitor:
-    """Track cache-read drops and attribute them to prompt-state changes."""
+    """Track cache-read drops and attribute them to prompt-state changes.
 
-    def __init__(self, *, min_drop_tokens: int = 2000, min_drop_ratio: float = 0.05) -> None:
-        self._baselines: dict[str, _CacheBaseline] = {}
-        self._reset_pending: set[str] = set()
+    State is per session and bounded two ways: the gateway evicts a session's
+    baseline when the session reaches a terminal status (see
+    ``SessionManager._evict_session_runtime_state``), and ``max_sessions``
+    caps what a long-running process retains for sessions that never get
+    there. Dropping a baseline is behaviorally inert — this monitor only
+    reports diagnostics, and a session whose baseline was dropped simply
+    re-initializes on its next response instead of comparing against it.
+    """
+
+    def __init__(
+        self,
+        *,
+        min_drop_tokens: int = 2000,
+        min_drop_ratio: float = 0.05,
+        max_sessions: int = _MAX_TRACKED_SESSIONS,
+    ) -> None:
+        self._baselines: OrderedDict[str, _CacheBaseline] = OrderedDict()
+        # Insertion-ordered so the same LRU bound applies here. A pending reset
+        # normally pairs with a baseline and is cleared by the session's next
+        # response, but `notify_compaction` accepts any key — including one that
+        # never produced a baseline to evict alongside — so this needs its own
+        # bound rather than relying on the baseline trim to carry it.
+        self._reset_pending: OrderedDict[str, None] = OrderedDict()
         self._min_drop_tokens = max(0, int(min_drop_tokens))
         self._min_drop_ratio = max(0.0, float(min_drop_ratio))
+        self._max_sessions = max(1, int(max_sessions))
+
+    @property
+    def tracked_session_count(self) -> int:
+        """Sessions currently holding baseline or pending-reset state."""
+        return len(self._baselines.keys() | self._reset_pending.keys())
 
     def record_prompt_state(
         self,
@@ -197,8 +230,10 @@ class CacheBreakMonitor:
         previous = self._baselines.get(session_key)
         reset_pending = session_key in self._reset_pending
         self._baselines[session_key] = _CacheBaseline(snapshot, current_tokens)
+        self._baselines.move_to_end(session_key)
+        self._trim_to_max_sessions()
         if reset_pending:
-            self._reset_pending.discard(session_key)
+            self._reset_pending.pop(session_key, None)
             return CacheBreakReport(
                 break_detected=False,
                 reason="baseline_reset_after_compaction",
@@ -232,9 +267,36 @@ class CacheBreakMonitor:
             current_snapshot=snapshot if break_detected else None,
         )
 
+    def _trim_to_max_sessions(self) -> None:
+        """Drop least-recently-touched entries beyond ``max_sessions``.
+
+        Both maps are trimmed. Evicting a baseline also drops any pending reset
+        for that session, since the reset only means anything alongside one.
+        """
+        while len(self._baselines) > self._max_sessions:
+            evicted_key, _ = self._baselines.popitem(last=False)
+            self._reset_pending.pop(evicted_key, None)
+        while len(self._reset_pending) > self._max_sessions:
+            self._reset_pending.popitem(last=False)
+
     def notify_compaction(self, session_key: str) -> None:
         """Treat the next provider response for this session as a new baseline."""
-        self._reset_pending.add(session_key)
+        self._reset_pending[session_key] = None
+        self._reset_pending.move_to_end(session_key)
+        self._trim_to_max_sessions()
+
+    def evict(self, session_key: str) -> bool:
+        """Drop all state for ``session_key``; True when something was held.
+
+        Called when a session reaches a terminal status so long-running
+        gateway processes do not retain a baseline per session forever.
+        """
+        removed_baseline = self._baselines.pop(session_key, None) is not None
+        # Membership, not the popped value: `_reset_pending` maps every key to
+        # None, so `pop(key, None) is not None` would always report False.
+        removed_pending = session_key in self._reset_pending
+        self._reset_pending.pop(session_key, None)
+        return removed_baseline or removed_pending
 
     def clear(self) -> None:
         self._baselines.clear()
@@ -286,6 +348,11 @@ def check_response_for_cache_break(
         snapshot,
         cache_read_tokens,
     )
+
+
+def evict_session(session_key: str) -> bool:
+    """Drop process-wide cache-break state for a terminated session."""
+    return default_cache_break_monitor.evict(session_key)
 
 
 def notify_compaction(

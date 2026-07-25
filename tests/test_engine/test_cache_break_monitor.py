@@ -247,3 +247,134 @@ def test_notify_compaction_can_reset_cache_without_notifying_listeners(
 
     assert events == []
     assert report.reason == "baseline_reset_after_compaction"
+
+
+def _record(monitor: CacheBreakMonitor, session_key: str, tokens: int = 5000) -> None:
+    snapshot = monitor.record_prompt_state(
+        messages=[
+            Message(role="user", content=f"old {session_key}"),
+            Message(role="user", content="now"),
+        ],
+        tools=None,
+        config=ChatConfig(system="stable system"),
+        model="model-a",
+    )
+    monitor.check_response_for_cache_break(session_key, snapshot, tokens)
+
+
+def test_evict_drops_baseline_and_pending_reset_for_one_session() -> None:
+    monitor = CacheBreakMonitor(min_drop_tokens=10, min_drop_ratio=0.05)
+    _record(monitor, "agent:main:s1")
+    _record(monitor, "agent:main:s2")
+    monitor.notify_compaction("agent:main:s1")
+
+    assert monitor.evict("agent:main:s1") is True
+    assert monitor.tracked_session_count == 1
+
+    # The evicted session re-initializes instead of reporting a stale break,
+    # and the sibling session keeps its own baseline.
+    after_evicted = monitor.record_prompt_state(
+        messages=[Message(role="user", content="fresh"), Message(role="user", content="now")],
+        tools=None,
+        config=ChatConfig(system="different system"),
+        model="model-b",
+    )
+    report = monitor.check_response_for_cache_break("agent:main:s1", after_evicted, 0)
+
+    assert report.break_detected is False
+    assert report.reason == "baseline_initialized"
+
+
+def test_evict_reports_false_for_untracked_session() -> None:
+    monitor = CacheBreakMonitor()
+
+    assert monitor.evict("agent:main:never-seen") is False
+
+
+def test_module_level_evict_session_targets_the_default_monitor(monkeypatch) -> None:
+    monitor = CacheBreakMonitor(min_drop_tokens=10, min_drop_ratio=0.05)
+    monkeypatch.setattr(cache_break_monitor, "default_cache_break_monitor", monitor)
+    _record(monitor, "agent:main:s1")
+
+    assert cache_break_monitor.evict_session("agent:main:s1") is True
+    assert monitor.tracked_session_count == 0
+
+
+def test_tracked_sessions_stay_bounded_without_explicit_eviction() -> None:
+    monitor = CacheBreakMonitor(max_sessions=4)
+
+    for index in range(50):
+        _record(monitor, f"agent:main:s{index}")
+
+    assert monitor.tracked_session_count == 4
+
+
+def test_lru_eviction_never_reports_a_false_break() -> None:
+    monitor = CacheBreakMonitor(min_drop_tokens=10, min_drop_ratio=0.05, max_sessions=2)
+    _record(monitor, "agent:main:cold", tokens=5000)
+    # Push the cold session out of the bound with unrelated traffic.
+    _record(monitor, "agent:main:hot1")
+    _record(monitor, "agent:main:hot2")
+
+    # A cache-read collapse that WOULD have been attributed as a break now only
+    # re-initializes: losing diagnostics state must never fabricate a finding.
+    changed = monitor.record_prompt_state(
+        messages=[Message(role="user", content="changed"), Message(role="user", content="now")],
+        tools=None,
+        config=ChatConfig(system="different system"),
+        model="model-b",
+    )
+    report = monitor.check_response_for_cache_break("agent:main:cold", changed, 0)
+
+    assert report.break_detected is False
+    assert report.reason == "baseline_initialized"
+
+
+def test_most_recently_used_session_survives_the_bound() -> None:
+    monitor = CacheBreakMonitor(min_drop_tokens=10, min_drop_ratio=0.05, max_sessions=2)
+    _record(monitor, "agent:main:keep", tokens=5000)
+    _record(monitor, "agent:main:filler1")
+    # Touching "keep" again must move it back to the fresh end of the bound.
+    _record(monitor, "agent:main:keep", tokens=5000)
+    _record(monitor, "agent:main:filler2")
+
+    changed = monitor.record_prompt_state(
+        messages=[Message(role="user", content="changed"), Message(role="user", content="now")],
+        tools=None,
+        config=ChatConfig(system="different system"),
+        model="model-b",
+    )
+    report = monitor.check_response_for_cache_break("agent:main:keep", changed, 0)
+
+    assert report.break_detected is True
+    assert report.reason == "cache_read_drop"
+
+
+def test_pending_resets_stay_bounded_without_a_paired_baseline() -> None:
+    """`notify_compaction` accepts keys the baseline trim will never evict."""
+    monitor = CacheBreakMonitor(max_sessions=4)
+
+    for index in range(50):
+        monitor.notify_compaction(f"agent:main:ghost{index}")
+
+    assert monitor.tracked_session_count == 4
+    # The most recent notification still does what it is for.
+    snapshot = monitor.record_prompt_state(
+        messages=[Message(role="user", content="old"), Message(role="user", content="now")],
+        tools=None,
+        config=ChatConfig(system="stable system"),
+        model="model-a",
+    )
+    report = monitor.check_response_for_cache_break("agent:main:ghost49", snapshot, 0)
+
+    assert report.reason == "baseline_reset_after_compaction"
+
+
+def test_evict_reports_true_for_a_pending_reset_without_a_baseline() -> None:
+    """A session can hold a pending reset and no baseline; eviction still counts."""
+    monitor = CacheBreakMonitor()
+    monitor.notify_compaction("agent:main:pending-only")
+
+    assert monitor.evict("agent:main:pending-only") is True
+    assert monitor.tracked_session_count == 0
+    assert monitor.evict("agent:main:pending-only") is False

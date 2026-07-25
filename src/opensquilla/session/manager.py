@@ -622,7 +622,7 @@ class SessionManager:
 
     @staticmethod
     def _evict_session_runtime_state(session_key: str) -> None:
-        """Drop in-memory subagent and routing bookkeeping for ``session_key``.
+        """Drop in-memory subagent, routing, and cache-break bookkeeping.
 
         Called from ``finish`` so terminal sessions don't leak unbounded
         entries in long-running gateway processes. Imports are local to
@@ -646,6 +646,12 @@ class SessionManager:
             from opensquilla.tools.builtin.sessions import evict_spawn_lock
 
             evict_spawn_lock(session_key)
+        except Exception:
+            pass
+        try:
+            from opensquilla.engine.cache_break_monitor import evict_session
+
+            evict_session(session_key)
         except Exception:
             pass
 
