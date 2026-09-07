@@ -230,6 +230,8 @@
         v-for="createdSession in createdSessions"
         :key="createdSession.callId"
         :session-key="createdSession.sessionKey"
+        :title="createdSession.title"
+        :resolve-session-availability="resolveSessionAvailability"
         @open="$emit('openSession', $event)"
       />
 
@@ -243,7 +245,6 @@
           :artifacts="message.artifacts"
           :navigation-artifacts="artifactNavigationItems"
           :session-key="sessionKey"
-          :auth-token="authToken"
           :prefer-workbench="workbenchEnabled"
           @download="$emit('downloadArtifact', $event)"
           @open="$emit('openArtifact', $event)"
@@ -474,7 +475,7 @@ import type {
 } from '@/types/chat'
 import type { GoalSnapshot } from '@/composables/chat/useChatGoals'
 import type { ChatPart } from '@/types/parts'
-import type { ArtifactPayload } from '@/types/rpc'
+import type { ArtifactPayload } from '@/types/artifacts'
 import type {
   PlanCardAction,
   PlanCardActionTarget,
@@ -516,7 +517,6 @@ const props = defineProps<{
   regenerateAvailable?: boolean
   artifactNavigationItems?: ArtifactPayload[]
   sessionKey?: string
-  authToken?: string
   workbenchEnabled?: boolean
   /** True for a durable completed turn tip, or the legacy current-tip fallback. */
   isTip?: boolean
@@ -526,6 +526,7 @@ const props = defineProps<{
   showTurnOutcome?: boolean
   goalOutcome?: GoalSnapshot | null
   goalElapsed?: string
+  resolveSessionAvailability?: (sessionKey: string) => Promise<boolean>
 }>()
 
 const emit = defineEmits<{

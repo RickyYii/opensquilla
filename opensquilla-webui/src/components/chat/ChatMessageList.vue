@@ -80,7 +80,6 @@
           :tool-status-text="toolStatusText"
           :tool-secondary-text="toolSecondaryText"
           :session-key="sessionKey"
-          :auth-token="authToken"
           :workbench-enabled="workbenchEnabled"
           :artifact-navigation-items="artifactNavigationItems"
           :copy-message="copyMessage"
@@ -92,6 +91,7 @@
           :show-turn-outcome="isTurnTip(entry.index)"
           :goal-outcome="goalOutcomeFor(messages[entry.index], entry.index)"
           :goal-elapsed="goalElapsed"
+          :resolve-session-availability="resolveSessionAvailability"
           @fork="$emit('forkConversation', forkThroughTurnId(entry.index))"
           @regenerate="$emit('regenerateMessage', $event)"
           @toggle-share="$emit('toggleShareMessage', $event)"
@@ -151,7 +151,7 @@ import type {
   ChatToolCallRenderItem,
   ToolResultContext,
 } from '@/types/chat'
-import type { ArtifactPayload } from '@/types/rpc'
+import type { ArtifactPayload } from '@/types/artifacts'
 import {
   goalHasSettledTerminalOutcome,
   type GoalSnapshot,
@@ -191,7 +191,6 @@ const props = defineProps<{
   downloadAttachment: (attachment: import('@/types/chat').DisplayAttachment) => Promise<boolean>
   artifactNavigationItems?: ArtifactPayload[]
   sessionKey?: string
-  authToken?: string
   workbenchEnabled?: boolean
   workbenchResourcePreviewEnabled?: boolean
   workbenchResourceEditEnabled?: boolean
@@ -203,6 +202,7 @@ const props = defineProps<{
   isStreaming?: boolean
   goal?: GoalSnapshot | null
   goalElapsed?: string
+  resolveSessionAvailability?: (sessionKey: string) => Promise<boolean>
   /** Required for long-history virtualization; omitted by legacy embedders. */
   scrollContainer?: HTMLElement | null
   /** Session/render epoch used to invalidate deferred scroll corrections. */

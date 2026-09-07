@@ -4,12 +4,9 @@ import type {
   NativeWorkbenchSurfaceResult,
   Platform,
 } from '@/platform/types'
-import type { ArtifactPayload } from '@/types/rpc'
+import type { ArtifactPayload } from '@/types/artifacts'
 import { createLegacyArtifactWorkspace } from '@/workbench/artifactDocumentProvider'
-import {
-  createArtifactCollectionWorkbenchItem,
-  createArtifactPreviewWorkbenchItem,
-} from '@/workbench/artifactItems'
+import { createArtifactPreviewWorkbenchItem } from '@/workbench/artifactItems'
 import {
   artifactPayloadFromWorkbenchResource,
   resourceFromPreparedPreview,
@@ -19,7 +16,58 @@ import type {
   WorkbenchPanelRenderState,
   WorkbenchRuntimeContext,
 } from '@/workbench/types'
-import { createArtifactWorkbenchDefinitions } from './artifactWorkbenchProvider'
+import type {
+  ArtifactContentAccess,
+  ArtifactPreviewAccess,
+} from '@/modules/artifactWorkbench'
+import { createV4ArtifactContentAccess } from '@/adapters/gateway/artifactAccessV4'
+import { createV4ArtifactPreviews } from '@/adapters/gateway/artifactPreviewsV4'
+import {
+  HttpTransportError,
+  type HttpTransport,
+} from '@/adapters/gateway/privateHttpTransport'
+import {
+  httpBinaryResponse,
+  httpTransportTestDouble,
+} from '@/testing/httpTransport.test-helper'
+import {
+  createArtifactWorkbenchDefinitions as createDefinitions,
+  type ArtifactWorkbenchProviderOptions,
+} from './artifactWorkbenchProvider'
+
+const testHttp: HttpTransport = {
+  clearPreviewOrigin: vi.fn(async () => undefined),
+  fetchExternalArtifact: vi.fn(async () => { throw new Error('unexpected external request') }),
+  requestBinary: vi.fn(async () => { throw new Error('unexpected binary request') }),
+  requestBlob: vi.fn(async () => new Blob()),
+  requestJson: vi.fn(async () => { throw new Error('unexpected JSON request') }),
+}
+
+const testArtifactContent: ArtifactContentAccess = {
+  ...createV4ArtifactContentAccess(testHttp),
+  fetchAttachment: vi.fn(async () => ({
+    ok: false as const,
+    status: 0,
+    source: 'none' as const,
+    url: '',
+    message: 'not used',
+  })),
+  uploadAttachment: vi.fn(async () => ({ fileUuid: 'test-file' })),
+}
+const testArtifactPreviews: ArtifactPreviewAccess = createV4ArtifactPreviews(testHttp, {
+  baseOrigin: () => 'http://localhost',
+})
+
+function createArtifactWorkbenchDefinitions(
+  options: Omit<ArtifactWorkbenchProviderOptions, 'artifactContent' | 'artifactPreviews'>
+    & Partial<Pick<ArtifactWorkbenchProviderOptions, 'artifactContent' | 'artifactPreviews'>>,
+) {
+  return createDefinitions({
+    artifactContent: testArtifactContent,
+    artifactPreviews: testArtifactPreviews,
+    ...options,
+  })
+}
 
 const artifact: ArtifactPayload = {
   id: 'artifact-1',
@@ -67,11 +115,9 @@ async function createNativeRuntimeHarness(
     sessionKey: 'session-a',
   })
   const definition = createArtifactWorkbenchDefinitions({
-    authToken: () => '',
     baseOrigin: 'http://localhost',
     confirmRemoteResources,
     currentSessionId: () => 'session-a',
-    openArtifact: vi.fn(),
     platform: {
       capabilities: { canOpenArtifactsNatively: false },
       files: {},
@@ -255,11 +301,9 @@ async function createAnnotationDraftHarness(
       releaseOverlayEdit,
       setActiveDocument: vi.fn(),
     },
-    authToken: () => 'synthetic-token',
     baseOrigin: 'http://127.0.0.1:18791',
     confirmRemoteResources: vi.fn(async () => true),
     currentSessionId: () => 'session-a',
-    openArtifact: vi.fn(),
     platform: {
       id: 'desktop',
       capabilities: { canOpenArtifactsNatively: true },
@@ -960,10 +1004,11 @@ describe('artifact Workbench provider', () => {
   })
 
   it('does not expose a Desktop native-open diagnostic in the toast', async () => {
-    vi.stubGlobal('fetch', vi.fn(async () => new Response('<p>fixture</p>', {
-      status: 200,
-      headers: { 'content-type': 'text/html' },
-    })))
+    const http = httpTransportTestDouble({
+      requestBinary: vi.fn(async () => httpBinaryResponse('<p>fixture</p>', {
+        contentType: 'text/html',
+      })),
+    })
     const diagnostic = 'spawn EACCES /private/operator/report.html'
     const nativeOpen = vi.fn(async () => ({ ok: false, message: diagnostic }))
     const pushToast = vi.fn()
@@ -974,11 +1019,13 @@ describe('artifact Workbench provider', () => {
       sessionKey: 'session-a',
     })
     const definition = createArtifactWorkbenchDefinitions({
-      authToken: () => 'synthetic-token',
+      artifactContent: {
+        ...testArtifactContent,
+        ...createV4ArtifactContentAccess(http),
+      },
       baseOrigin: 'http://localhost',
       confirmRemoteResources: vi.fn(async () => true),
       currentSessionId: () => 'session-a',
-      openArtifact: vi.fn(),
       platform: {
         id: 'desktop',
         capabilities: { canOpenArtifactsNatively: true },
@@ -1041,11 +1088,9 @@ describe('artifact Workbench provider', () => {
         })),
         headArtifact: vi.fn(value => value),
       },
-      authToken: () => '',
       baseOrigin: 'http://localhost',
       confirmRemoteResources: vi.fn(async () => true),
       currentSessionId: () => 'session-a',
-      openArtifact: vi.fn(),
       platform: { capabilities: {}, files: {} } as unknown as Platform,
       publishDocument,
       pushToast,
@@ -1095,11 +1140,9 @@ describe('artifact Workbench provider', () => {
         })),
         headArtifact: vi.fn(value => value),
       },
-      authToken: () => 'synthetic-token',
       baseOrigin: 'http://127.0.0.1:18791',
       confirmRemoteResources: vi.fn(async () => true),
       currentSessionId: () => 'session-a',
-      openArtifact: vi.fn(),
       platform: { capabilities: {}, files: {} } as unknown as Platform,
       previewLeasesEnabled: true,
       pushToast: vi.fn(),
@@ -1176,13 +1219,19 @@ describe('artifact Workbench provider', () => {
       sessionKey: 'session-a',
     })
     const renderState: Record<string, unknown> = {}
+    const requestBinary = vi.fn(async () => {
+      throw new HttpTransportError('http-status', 'missing', 404)
+    })
+    const http = httpTransportTestDouble({ requestBinary })
     const definition = createArtifactWorkbenchDefinitions({
+      artifactContent: {
+        ...testArtifactContent,
+        ...createV4ArtifactContentAccess(http),
+      },
       artifactDocuments: { load, snapshot, headArtifact },
-      authToken: () => 'synthetic-token',
       baseOrigin: 'http://127.0.0.1:18791',
       confirmRemoteResources: vi.fn(async () => true),
       currentSessionId: () => 'session-a',
-      openArtifact: vi.fn(),
       platform: { capabilities: {}, files: {} } as unknown as Platform,
       previewLeasesEnabled: true,
       pushToast: vi.fn(),
@@ -1220,12 +1269,10 @@ describe('artifact Workbench provider', () => {
     expect(props.documentSnapshot).toBeUndefined()
     expect(props.documentActions).toBeUndefined()
 
-    const fetchImpl = vi.fn(async () => new Response(null, { status: 404 }))
-    vi.stubGlobal('fetch', fetchImpl)
     await runtime.performAction?.('download', item)
-    expect(fetchImpl).toHaveBeenCalledWith(
+    expect(requestBinary).toHaveBeenCalledWith(
       '/api/v1/workbench/previews/attachment-rev-1',
-      expect.objectContaining({ method: 'GET' }),
+      expect.objectContaining({ sessionKey: 'session-a', timeoutMs: 0 }),
     )
     expect(headArtifact).not.toHaveBeenCalled()
   })
@@ -1245,11 +1292,9 @@ describe('artifact Workbench provider', () => {
       sessionKey: 'session-a',
     })
     const definition = createArtifactWorkbenchDefinitions({
-      authToken: () => '',
       baseOrigin: 'http://localhost',
       confirmRemoteResources: vi.fn(async () => true),
       currentSessionId: () => 'session-a',
-      openArtifact: vi.fn(),
       platform: { capabilities: {}, files: {} } as unknown as Platform,
       pushToast: vi.fn(),
       t: key => key,
@@ -1295,12 +1340,10 @@ describe('artifact Workbench provider', () => {
       sessionKey: 'session-a',
     })
     const definition = createArtifactWorkbenchDefinitions({
-      authToken: () => 'synthetic-token',
       baseOrigin: 'http://127.0.0.1:18791',
       confirmRemoteResources,
       currentSessionId: () => 'session-a',
       getPreviewPreferences: async () => ({ mode: 'full', noticeShown: false }),
-      openArtifact: vi.fn(),
       platform: { capabilities: {}, files: {} } as unknown as Platform,
       previewLeasesEnabled: true,
       pushToast: vi.fn(),
@@ -1467,11 +1510,9 @@ describe('artifact Workbench provider', () => {
         })),
         headArtifact: vi.fn(() => currentHead),
       },
-      authToken: () => 'synthetic-token',
       baseOrigin: 'http://127.0.0.1:18791',
       confirmRemoteResources: vi.fn(async () => true),
       currentSessionId: () => 'session-a',
-      openArtifact: vi.fn(),
       platform: {
         id: 'desktop',
         capabilities: { canOpenArtifactsNatively: false },
@@ -1551,11 +1592,9 @@ describe('artifact Workbench provider', () => {
       sessionKey: 'session-a',
     })
     const definition = createArtifactWorkbenchDefinitions({
-      authToken: () => '',
       baseOrigin: 'http://localhost',
       confirmRemoteResources: vi.fn(async () => true),
       currentSessionId: () => 'session-a',
-      openArtifact: vi.fn(),
       platform: {
         id: 'web',
         capabilities: { canOpenArtifactsNatively: false },
@@ -1711,12 +1750,10 @@ describe('artifact Workbench provider', () => {
       sessionKey: 'session-a',
     })
     const definition = createArtifactWorkbenchDefinitions({
-      authToken: () => '',
       baseOrigin: 'http://127.0.0.1:18791',
       confirmRemoteResources: vi.fn(async () => true),
       currentSessionId: () => 'session-a',
       getPreviewPreferences: async () => ({ mode: 'offline', noticeShown: false }),
-      openArtifact: vi.fn(),
       platform: {
         id: 'desktop',
         capabilities: { canOpenArtifactsNatively: false },
@@ -1792,11 +1829,9 @@ describe('artifact Workbench provider', () => {
       sessionKey: 'session-a',
     })
     const definitions = createArtifactWorkbenchDefinitions({
-      authToken: () => '',
       baseOrigin: 'http://localhost',
       confirmRemoteResources,
       currentSessionId: () => 'session-a',
-      openArtifact: vi.fn(),
       platform: {
         capabilities: { canOpenArtifactsNatively: false },
         files: {},
@@ -1938,11 +1973,9 @@ describe('artifact Workbench provider', () => {
       sessionKey: 'session-a',
     })
     const definition = createArtifactWorkbenchDefinitions({
-      authToken: () => '',
       baseOrigin: 'http://localhost',
       confirmRemoteResources: vi.fn(async () => true),
       currentSessionId: () => 'session-a',
-      openArtifact: vi.fn(),
       platform: {
         capabilities: { canOpenArtifactsNatively: false },
         files: {},
@@ -2210,11 +2243,9 @@ describe('artifact Workbench provider', () => {
       sessionKey: 'session-a',
     })
     const definition = createArtifactWorkbenchDefinitions({
-      authToken: () => 'synthetic-token',
       baseOrigin: 'http://127.0.0.1:18791',
       confirmRemoteResources: vi.fn(async () => true),
       currentSessionId: () => 'session-a',
-      openArtifact: vi.fn(),
       platform: {
         id: 'desktop',
         capabilities: { canOpenArtifactsNatively: false },
@@ -2329,11 +2360,9 @@ describe('artifact Workbench provider', () => {
       sessionKey: 'session-a',
     })
     const definition = createArtifactWorkbenchDefinitions({
-      authToken: () => 'synthetic-token',
       baseOrigin: 'http://127.0.0.1:18791',
       confirmRemoteResources: vi.fn(async () => true),
       currentSessionId: () => 'session-a',
-      openArtifact: vi.fn(),
       platform: {
         id: 'desktop',
         capabilities: { canOpenArtifactsNatively: true },
@@ -2394,11 +2423,9 @@ describe('artifact Workbench provider', () => {
       sessionKey: 'session-a',
     })
     const definition = createArtifactWorkbenchDefinitions({
-      authToken: () => '',
       baseOrigin: 'http://127.0.0.1:18791',
       confirmRemoteResources: vi.fn(async () => true),
       currentSessionId: () => 'session-a',
-      openArtifact: vi.fn(),
       platform: {
         id: 'desktop',
         capabilities: { canOpenArtifactsNatively: false },
@@ -2427,8 +2454,7 @@ describe('artifact Workbench provider', () => {
   it('clears a Web preview origin before revoking its lease on normal close', async () => {
     const previewOrigin =
       'http://p-0123456789abcdef0123456789abcdef.localhost:48721'
-    const fetchMock = vi.fn()
-      .mockResolvedValueOnce(new Response(JSON.stringify({
+    const requestJson = vi.fn(async (_endpoint: string, _options?: unknown) => ({
         version: 1,
         lease_id: 'apl-web-fixture',
         effective_mode: 'full',
@@ -2444,13 +2470,10 @@ describe('artifact Workbench provider', () => {
           total_bytes: 42,
           warning_codes: [],
         },
-      }), {
-        status: 201,
-        headers: { 'content-type': 'application/json' },
       }))
-      .mockResolvedValueOnce(new Response(null, { status: 204 }))
-      .mockResolvedValueOnce(new Response(null, { status: 204 }))
-    vi.stubGlobal('fetch', fetchMock)
+    const clearPreviewOrigin = vi.fn(async (_origin: string) => undefined)
+    const requestBlob = vi.fn(async (_endpoint: string, _options?: unknown) => new Blob())
+    const http = httpTransportTestDouble({ clearPreviewOrigin, requestBlob, requestJson })
     try {
       const renderState: Record<string, unknown> = {}
       const previewItem = createArtifactPreviewWorkbenchItem({
@@ -2459,11 +2482,16 @@ describe('artifact Workbench provider', () => {
         sessionKey: 'session-a',
       })
       const definition = createArtifactWorkbenchDefinitions({
-        authToken: () => '',
+        artifactContent: {
+          ...testArtifactContent,
+          ...createV4ArtifactContentAccess(http),
+        },
+        artifactPreviews: createV4ArtifactPreviews(http, {
+          baseOrigin: () => 'http://127.0.0.1:18791',
+        }),
         baseOrigin: 'http://127.0.0.1:18791',
         confirmRemoteResources: vi.fn(async () => true),
         currentSessionId: () => 'session-a',
-        openArtifact: vi.fn(),
         platform: {
           id: 'web',
           capabilities: { canOpenArtifactsNatively: false },
@@ -2483,16 +2511,18 @@ describe('artifact Workbench provider', () => {
 
       await runtime.dispose?.('closed')
 
-      expect(String(fetchMock.mock.calls[1]?.[0])).toBe(
-        `${previewOrigin}/.opensquilla/clear-site-data`,
-      )
-      expect(fetchMock.mock.calls[1]?.[1]).toMatchObject({
-        credentials: 'omit',
-        mode: 'no-cors',
-        referrerPolicy: 'no-referrer',
-      })
-      expect(String(fetchMock.mock.calls[2]?.[0])).toContain(
+      expect(clearPreviewOrigin).toHaveBeenCalledWith(previewOrigin)
+      expect(String(requestBlob.mock.calls[0]?.[0])).toContain(
         '/api/v1/artifact-preview-leases/apl-web-fixture',
+      )
+      expect(requestBlob.mock.calls[0]?.[1]).toMatchObject({
+        keepalive: true,
+        method: 'DELETE',
+        sessionKey: 'session-a',
+        timeoutMs: 0,
+      })
+      expect(clearPreviewOrigin.mock.invocationCallOrder[0]).toBeLessThan(
+        requestBlob.mock.invocationCallOrder[0]!,
       )
     } finally {
       vi.unstubAllGlobals()
@@ -2621,11 +2651,9 @@ describe('artifact Workbench provider', () => {
         discard: vi.fn(async () => true),
         setActiveDocument: vi.fn(),
       },
-      authToken: () => 'synthetic-token',
       baseOrigin: 'http://127.0.0.1:18791',
       confirmRemoteResources: vi.fn(async () => true),
       currentSessionId: () => 'session-a',
-      openArtifact: vi.fn(),
       platform: {
         id: 'desktop',
         capabilities: { canOpenArtifactsNatively: true },
@@ -2818,11 +2846,9 @@ describe('artifact Workbench provider', () => {
         })),
         headArtifact: vi.fn(() => workspace.headArtifact),
       },
-      authToken: () => 'synthetic-token',
       baseOrigin: 'http://127.0.0.1:18791',
       confirmRemoteResources: vi.fn(async () => true),
       currentSessionId: () => 'session-a',
-      openArtifact: vi.fn(),
       platform: {
         id: 'desktop',
         capabilities: { canOpenArtifactsNatively: true },
@@ -2992,11 +3018,9 @@ describe('artifact Workbench provider', () => {
         discard: vi.fn(async () => true),
         setActiveDocument: vi.fn(),
       },
-      authToken: () => 'synthetic-token',
       baseOrigin: 'http://127.0.0.1:18791',
       confirmRemoteResources: vi.fn(async () => true),
       currentSessionId: () => 'session-a',
-      openArtifact: vi.fn(),
       platform: {
         id: 'desktop',
         capabilities: { canOpenArtifactsNatively: true },
@@ -3408,11 +3432,9 @@ describe('artifact Workbench provider', () => {
         releaseOverlayEdit,
         setActiveDocument,
       },
-      authToken: () => 'synthetic-token',
       baseOrigin: 'http://127.0.0.1:18791',
       confirmRemoteResources: vi.fn(async () => true),
       currentSessionId: () => 'session-a',
-      openArtifact: vi.fn(),
       platform: {
         id: 'desktop',
         capabilities: { canOpenArtifactsNatively: true },
@@ -4161,46 +4183,4 @@ describe('artifact Workbench provider', () => {
     revokeScreenshotUrl.mockRestore()
   })
 
-  it('routes collection selections to a preview without losing the full list', async () => {
-    const openArtifact = vi.fn()
-    const item = createArtifactCollectionWorkbenchItem({
-      artifacts: [artifact],
-      sessionKey: 'session-a',
-      title: 'Deliverables (1)',
-    })
-    const definition = createArtifactWorkbenchDefinitions({
-      authToken: () => '',
-      baseOrigin: 'http://localhost',
-      confirmRemoteResources: vi.fn(async () => true),
-      currentSessionId: () => 'session-a',
-      openArtifact,
-      platform: {
-        capabilities: { canOpenArtifactsNatively: false },
-        files: {},
-      } as unknown as Platform,
-      pushToast: vi.fn(),
-      t: key => key,
-    }).find(candidate => candidate.kind === 'artifact-collection')!
-    const context: WorkbenchRuntimeContext = {
-      getRenderState: () => ({}),
-      updateRenderState: vi.fn(),
-      isItemOpen: () => true,
-      setExpanded: vi.fn(),
-      reportError: vi.fn(),
-    }
-    const runtime = await definition.createRuntime!(item, context)
-
-    await runtime.handleComponentEvent?.({
-      type: 'artifact-open',
-      payload: artifact,
-    }, item)
-
-    expect(openArtifact).toHaveBeenCalledWith(artifact, 'session-a', [artifact])
-    expect(definition.getProps?.(item, {
-      active: true,
-      hostAvailable: true,
-      nativeSurface: false,
-      runtimeState: {},
-    })).toMatchObject({ artifacts: [artifact] })
-  })
 })
