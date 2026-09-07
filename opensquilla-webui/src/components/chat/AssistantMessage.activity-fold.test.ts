@@ -15,6 +15,11 @@ import type {
 } from '@/types/chat'
 import type { ChatPart } from '@/types/parts'
 import AssistantMessage from './AssistantMessage.vue'
+import { ARTIFACT_WORKBENCH_KEY, type ArtifactWorkbench } from '@/modules/artifactWorkbench'
+import { GATEWAY_ACCESS_KEY, type GatewayAccess } from '@/modules/gatewayAccess'
+import { createV4ArtifactContentAccess } from '@/adapters/gateway/artifactAccessV4'
+import { createV4ArtifactPreviews } from '@/adapters/gateway/artifactPreviewsV4'
+import { httpTransportTestDouble } from '@/testing/httpTransport.test-helper'
 
 const mountedApps: App[] = []
 
@@ -248,6 +253,7 @@ function mountMessage(
   showTurnOutcome = false,
   extraProps: Record<string, unknown> = {},
 ): HTMLElement {
+  const http = httpTransportTestDouble()
   const el = document.createElement('div')
   document.body.appendChild(el)
   const app = createApp({
@@ -274,6 +280,13 @@ function mountMessage(
   mountedApps.push(app)
   app.use(i18n)
   app.use(createPinia())
+  app.provide(GATEWAY_ACCESS_KEY, {
+    isLocalOwner: false,
+  } as GatewayAccess)
+  app.provide(ARTIFACT_WORKBENCH_KEY, {
+    content: createV4ArtifactContentAccess(http),
+    previews: createV4ArtifactPreviews(http, { baseOrigin: () => 'http://localhost' }),
+  } as ArtifactWorkbench)
   app.mount(el)
   return el
 }
@@ -895,6 +908,35 @@ describe('AssistantMessage activity disclosure', () => {
     expect(activity?.querySelector('.thinking-block__header')).toBeNull()
     expect(activity?.querySelector('.thinking-block__body')?.textContent)
       .toBe('Checked constraints and compatibility.')
+  })
+
+  it('keeps explicit tool progress inside activity instead of the Plan intro', async () => {
+    const marker = 'E2E_TOOL_PROGRESS_MARKER'
+    const el = mountMessage(baseMessage({
+      text: marker,
+      timelineItems: [
+        {
+          type: 'text',
+          key: 'progress-marker',
+          html: `<p>${marker}</p>`,
+          rawText: marker,
+          presentation: 'intermediate',
+        },
+        timelineGroup(successfulCall('submit-plan', 'submit_plan')),
+      ],
+      parts: [planPart()],
+      statusHistory: [],
+    }))
+    await nextTick()
+
+    const activity = el.querySelector<HTMLElement>('.assistant-activity')
+    const outsideText = [...el.querySelectorAll<HTMLElement>('.msg-ai-text')]
+      .filter(node => !activity?.contains(node))
+
+    expect(el.querySelector('.plan-card')).not.toBeNull()
+    expect(activity?.textContent).toContain(marker)
+    expect(el.querySelector('.plan-message-intro')).toBeNull()
+    expect(outsideText.every(node => !node.textContent?.includes(marker))).toBe(true)
   })
 
   it('does not add a generic completed receipt below a Plan card', async () => {

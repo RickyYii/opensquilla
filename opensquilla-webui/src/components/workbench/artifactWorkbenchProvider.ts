@@ -2,7 +2,7 @@ import type {
   Platform,
   WorkbenchPreviewMode,
 } from '@/platform/types'
-import type { ArtifactPayload } from '@/types/rpc'
+import type { ArtifactPayload } from '@/types/artifacts'
 import type { ArtifactDocumentWorkspaceSnapshot } from '@/types/artifactDocuments'
 import type { ArtifactDocumentActions } from '@/types/artifactDocuments'
 import type {
@@ -11,11 +11,16 @@ import type {
 } from '@/types/promptAnnotations'
 import { promptAnnotationBodyWithinLimit } from '@/types/promptAnnotations'
 import {
-  fetchArtifactBlob,
   isActiveDocumentArtifactCandidate,
-  openArtifactBlobUrl,
-  openArtifactViaGateway,
 } from '@/utils/chat/artifactAccess'
+import {
+  ArtifactPreviewLeaseError,
+  type ArtifactContentAccess,
+  type ArtifactPreviewAccess,
+  type ArtifactPreviewLease,
+  type ArtifactPreviewResourceState,
+  type NativeHtmlArtifactResource,
+} from '@/modules/artifactWorkbench'
 import {
   artifactFileSubtitle,
   artifactFileTitle,
@@ -27,7 +32,6 @@ import { promptAnnotationTargetLabel } from '@/utils/chat/promptAnnotationPresen
 import { classifyArtifactProductError } from '@/utils/artifactProductErrors'
 import {
   artifactFromWorkbenchItem,
-  artifactsFromWorkbenchItem,
   initialSectionFromWorkbenchItem,
   initialSectionRequestIdFromWorkbenchItem,
   preparedPreviewFromWorkbenchItem,
@@ -50,18 +54,6 @@ import type {
   NativeWorkbenchSurfaceEvent,
   NativeWorkbenchSurfaceRectRequest,
 } from '@/platform/types'
-import type {
-  ArtifactPreviewResourceState,
-  NativeHtmlArtifactResource,
-} from '@/composables/workbench/useArtifactPreviewResource'
-import {
-  ArtifactPreviewLeaseError,
-  createArtifactPreviewLease,
-  renewArtifactPreviewLease,
-  revokeArtifactPreviewLease,
-  type ArtifactPreviewLease,
-} from '@/utils/workbench/artifactPreviewLease'
-import ArtifactCollectionPanel from './ArtifactCollectionPanel.vue'
 import ArtifactDocumentPanel from './ArtifactDocumentPanel.vue'
 
 type Translate = (key: string, params?: Record<string, unknown>) => string
@@ -72,6 +64,8 @@ interface ArtifactPreviewPanelHandle {
 }
 
 export interface ArtifactWorkbenchProviderOptions {
+  artifactContent: ArtifactContentAccess
+  artifactPreviews: ArtifactPreviewAccess
   artifactDocuments?: {
     load(
       artifact: ArtifactPayload,
@@ -95,7 +89,6 @@ export interface ArtifactWorkbenchProviderOptions {
     releaseOverlayEdit?(annotationId: string): void
     setActiveDocument(sessionKey: string, documentId: string): void
   }
-  authToken(): string
   baseOrigin: string
   confirmPermission?(request: {
     permission: string
@@ -112,11 +105,6 @@ export interface ArtifactWorkbenchProviderOptions {
     noticeShown: boolean
   }): Promise<void>
   showFullPreviewNotice?(): void
-  openArtifact(
-    artifact: ArtifactPayload,
-    sessionKey: string,
-    navigationArtifacts: readonly ArtifactPayload[],
-  ): void
   publishDocument?(request: {
     sessionKey: string
     documentId: string
@@ -240,9 +228,7 @@ async function downloadArtifact(
   artifact: ArtifactPayload,
   options: ArtifactWorkbenchProviderOptions,
 ) {
-  const result = await fetchArtifactBlob(artifact, {
-    authToken: options.authToken(),
-    baseOrigin: options.baseOrigin,
+  const result = await options.artifactContent.fetchArtifact(artifact, {
     sessionKey: artifactSessionKey(item, options),
   })
   if (!result.ok) {
@@ -262,12 +248,9 @@ async function openArtifactExternally(
   options: ArtifactWorkbenchProviderOptions,
 ) {
   const sessionKey = artifactSessionKey(item, options)
-  const authToken = options.authToken()
   const { platform } = options
   if (platform.capabilities.canOpenArtifactsNatively && platform.files.openArtifact) {
-    const fetched = await fetchArtifactBlob(artifact, {
-      authToken,
-      baseOrigin: options.baseOrigin,
+    const fetched = await options.artifactContent.fetchArtifact(artifact, {
       sessionKey,
     })
     if (!fetched.ok) {
@@ -287,16 +270,8 @@ async function openArtifactExternally(
   }
 
   const opened = isActiveDocumentArtifactCandidate(artifact)
-    ? await openArtifactViaGateway(artifact, {
-      authToken,
-      baseOrigin: options.baseOrigin,
-      sessionKey,
-    })
-    : await openArtifactBlobUrl(artifact, {
-      authToken,
-      baseOrigin: options.baseOrigin,
-      sessionKey,
-    })
+    ? await options.artifactContent.openArtifact(artifact, { sessionKey })
+    : await options.artifactContent.openArtifactBlob(artifact, { sessionKey })
   if (!opened.ok) options.pushToast(opened.message, { tone: 'danger' })
 }
 
@@ -2134,13 +2109,11 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
 
     let lease: ArtifactPreviewLease
     try {
-      lease = await createArtifactPreviewLease(
+      lease = await this.options.artifactPreviews.createLease(
         artifact,
         this.mode,
         this.options.platform.id,
         {
-          authToken: this.options.authToken(),
-          baseOrigin: this.options.baseOrigin,
           nativeBroker: nativeApi,
           sessionKey: artifactSessionKey(this.item, this.options),
         },
@@ -2442,9 +2415,7 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
     const lease = this.lease
     if (!lease || !this.context.isItemOpen()) return
     try {
-      const renewal = await renewArtifactPreviewLease(lease.lease_id, {
-        authToken: this.options.authToken(),
-        baseOrigin: this.options.baseOrigin,
+      const renewal = await this.options.artifactPreviews.renewLease(lease.lease_id, {
         nativeBroker: this.context.nativeWorkbenchApi,
         sessionKey: artifactSessionKey(this.item, this.options),
       })
@@ -2486,24 +2457,10 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
     this.leaseArtifactId = ''
     if (!lease) return
     if (this.options.platform.id !== 'desktop' && lease.preview_origin) {
-      try {
-        const clearUrl = new URL('/.opensquilla/clear-site-data', lease.preview_origin)
-        await fetch(clearUrl, {
-          method: 'GET',
-          cache: 'no-store',
-          credentials: 'omit',
-          keepalive: true,
-          mode: 'no-cors',
-          redirect: 'error',
-          referrerPolicy: 'no-referrer',
-          signal: AbortSignal.timeout(2_000),
-        })
-      } catch {}
+      await this.options.artifactContent.clearPreviewStorage(lease.preview_origin)
     }
     try {
-      await revokeArtifactPreviewLease(lease.lease_id, {
-        authToken: this.options.authToken(),
-        baseOrigin: this.options.baseOrigin,
+      await this.options.artifactPreviews.revokeLease(lease.lease_id, {
         nativeBroker: this.context.nativeWorkbenchApi,
         sessionKey: artifactSessionKey(this.item, this.options),
       })
@@ -2965,23 +2922,6 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
   }
 }
 
-class ArtifactCollectionRuntime implements WorkbenchPanelRuntime {
-  constructor(
-    private readonly options: ArtifactWorkbenchProviderOptions,
-  ) {}
-
-  handleComponentEvent(event: WorkbenchComponentEvent, item: WorkbenchItem) {
-    if (event.type !== 'artifact-open') return
-    const artifact = artifactEventPayload(event)
-    if (!artifact) return
-    this.options.openArtifact(
-      artifact,
-      artifactSessionKey(item, this.options),
-      artifactsFromWorkbenchItem(item),
-    )
-  }
-}
-
 function artifactHeader(
   item: WorkbenchItem,
 ): { title: string; subtitle?: string; icon?: ReturnType<typeof artifactIconName> } {
@@ -3179,29 +3119,6 @@ export function createArtifactWorkbenchDefinitions(
 ): readonly WorkbenchPanelDefinition[] {
   return [
     {
-      kind: 'artifact-collection',
-      component: ArtifactCollectionPanel,
-      supports: item => item.kind === 'artifact-collection',
-      getHeader: item => ({
-        title: options.t('chat.deliverablesCount', {
-          count: artifactsFromWorkbenchItem(item).length,
-        }),
-      }),
-      getProps: item => ({
-        artifacts: artifactsFromWorkbenchItem(item),
-        emptyLabel: options.t('chat.noDeliverables'),
-        label: options.t('chat.sessionDeliverables'),
-        openArtifactLabel: (artifact: ArtifactPayload) => options.t(
-          'chat.openArtifact',
-          {
-            title: artifactFileTitle(artifact),
-            subtitle: artifactFileSubtitle(artifact),
-          },
-        ),
-      }),
-      createRuntime: () => new ArtifactCollectionRuntime(options),
-    },
-    {
       kind: 'artifact-preview',
       component: ArtifactDocumentPanel,
       supports: item => artifactFromWorkbenchItem(item) !== null,
@@ -3242,7 +3159,6 @@ export function createArtifactWorkbenchDefinitions(
         })(),
         initialSection: initialSectionFromWorkbenchItem(item),
         initialSectionRequestId: initialSectionRequestIdFromWorkbenchItem(item),
-        authToken: options.authToken(),
         baseOrigin: options.baseOrigin,
         nativeHtml: state.nativeSurface,
         agentEditInProgress: runtimeStateValue(state, 'agentEditInProgress', false),

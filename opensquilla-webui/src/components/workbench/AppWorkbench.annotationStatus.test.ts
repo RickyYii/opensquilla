@@ -88,7 +88,7 @@ describe('AppWorkbench annotation mode status', () => {
     // invalidation path; filtering by action here would leave Preview stale.
     expect(source).not.toContain('event.action')
     expect(appWorkbenchSource).toContain(
-      "rpc.on('session.event.artifact_state', onArtifactState)",
+      'artifactWorkbench.subscribeDocumentChanges(onArtifactState)',
     )
   })
 
@@ -166,14 +166,18 @@ describe('AppWorkbench annotation mode status', () => {
     ) || []
 
     expect(appWorkbenchSource).toContain('function artifactPreviewItemForExplicitOpen(')
-    expect(explicitOpenCalls).toHaveLength(3)
+    expect(explicitOpenCalls).toHaveLength(2)
     expect(appWorkbenchSource).not.toContain('let artifactSectionRequestId')
   })
 
   it('contains expected resource refresh aborts at every fire-and-forget call site', () => {
-    const guardedLoads = appWorkbenchSource.match(
-      /void workbenchResources\.load\([^;]+?\.catch\(\(\) => undefined\)/gs,
+    const loadCalls = appWorkbenchSource.match(
+      /void (?:artifactWorkbench\.ready\(\)\.then\(\(\) => )?workbenchResources\.load\(/g,
     ) || []
-    expect(guardedLoads).toHaveLength(4)
+    const guardedLoads = appWorkbenchSource.match(
+      /void (?:artifactWorkbench\.ready\(\)\.then\(\(\) => )?workbenchResources\.load\([^;]+?\.catch\(\(\) => undefined\)/gs,
+    ) || []
+    expect(loadCalls).toHaveLength(3)
+    expect(guardedLoads).toHaveLength(loadCalls.length)
   })
 })

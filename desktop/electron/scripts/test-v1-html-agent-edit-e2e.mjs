@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { execFile } from 'node:child_process'
 import { createServer } from 'node:http'
 import { createServer as createTcpServer } from 'node:net'
-import { cp, mkdtemp, mkdir, rm, symlink, writeFile } from 'node:fs/promises'
+import { cp, mkdtemp, mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
@@ -15,6 +15,13 @@ import {
   environmentWithoutProviderSecrets,
   waitFor,
 } from './packaged-smoke-helpers.mjs'
+import {
+  canAcceptWindowsElectronShutdownFallback,
+  closeElectronWithDeadline,
+  closeHttpServerWithDeadline,
+  desktopShutdownEvidenceSince,
+  trackHttpServerConnections,
+} from './e2e-shutdown-helpers.mjs'
 
 const scriptDir = dirname(fileURLToPath(import.meta.url))
 const electronRoot = join(scriptDir, '..')
@@ -70,6 +77,8 @@ const EXPECTED_CURRENT_DOCUMENT_TOOLS = [
   'document_read',
 ]
 const TIMEOUT_MS = 60_000
+const ELECTRON_SHUTDOWN_TIMEOUT_MS = 15_000
+const PROVIDER_SHUTDOWN_TIMEOUT_MS = 15_000
 // A cold desktop profile performs recovery discovery before it starts the
 // source Gateway. Keep functional assertions at 60 seconds, but allow this
 // one-time startup phase to complete on slower CI and developer machines.
@@ -420,6 +429,7 @@ async function startDeterministicProvider() {
       response.end(body)
     })
   })
+  const connections = trackHttpServerConnections(server)
 
   await new Promise((resolveListen, rejectListen) => {
     server.once('error', rejectListen)
@@ -433,9 +443,9 @@ async function startDeterministicProvider() {
     documentPatchCalls: () => documentPatchCalls,
     contextualLocateCalls: () => contextualLocateCalls,
     contextualCandidateErrors: () => contextualCandidateErrors,
-    close: () => new Promise((resolveClose, rejectClose) => {
-      server.closeIdleConnections?.()
-      server.close(error => error ? rejectClose(error) : resolveClose())
+    close: () => closeHttpServerWithDeadline(server, connections, {
+      label: 'Synthetic provider shutdown',
+      timeoutMs: PROVIDER_SHUTDOWN_TIMEOUT_MS,
     }),
   }
 }
@@ -1391,13 +1401,26 @@ async function typeAndSubmitAnnotation(electronApp, body) {
 async function dropNextChatSend(page) {
   await page.evaluate(() => {
     window.__opensquillaV1DroppedChatSend = false
+    window.__opensquillaV1DroppedChatSendRequest = null
+    window.__opensquillaV1ReplayedChatSendRequest = null
     const originalSend = WebSocket.prototype.send
-    WebSocket.prototype.send = function dropSyntheticSessionsSend(data) {
+    const captureReplay = function captureSyntheticSessionsReplay(data) {
       if (
         typeof data === 'string'
         && data.includes('"method":"chat.send"')
       ) {
         WebSocket.prototype.send = originalSend
+        window.__opensquillaV1ReplayedChatSendRequest = JSON.parse(data)
+      }
+      return originalSend.call(this, data)
+    }
+    WebSocket.prototype.send = function dropSyntheticSessionsSend(data) {
+      if (
+        typeof data === 'string'
+        && data.includes('"method":"chat.send"')
+      ) {
+        window.__opensquillaV1DroppedChatSendRequest = JSON.parse(data)
+        WebSocket.prototype.send = captureReplay
         window.__opensquillaV1DroppedChatSend = true
         this.close(4000, 'synthetic sessions.send disconnect')
         return
@@ -1432,7 +1455,8 @@ const evidence = {
   changesAfterAgentPatch: '',
   previewHeading: '',
   annotationModeExitedAfterAcceptance: false,
-  annotationSendFailureRetained: false,
+  annotationUnknownSendSettledWithoutDuplicates: false,
+  annotationReplayIdentityMatched: false,
   annotationAcceptanceEvents: [],
   annotationModeAfterAcceptance: null,
   annotationRequests: 0,
@@ -1451,6 +1475,29 @@ const evidence = {
   manualPreviewSnapshot: [],
   nativeAnnotationSurfaceEvents: [],
   durableMutation: null,
+}
+
+async function closeDesktopApp(targetApp, phase) {
+  const desktopLogPath = join(userDataDir, 'logs', 'desktop.log')
+  const desktopLogCheckpoint = await readFile(desktopLogPath, 'utf8').catch(() => null)
+  const shutdown = await closeElectronWithDeadline({
+    app: targetApp,
+    phase,
+    timeoutMs: ELECTRON_SHUTDOWN_TIMEOUT_MS,
+  })
+  if (!shutdown.error) return
+  const desktopLog = await readFile(desktopLogPath, 'utf8').catch(() => null)
+  const shutdownEvidence = desktopShutdownEvidenceSince(desktopLogCheckpoint, desktopLog)
+  if (!canAcceptWindowsElectronShutdownFallback({
+    shutdown,
+    ...shutdownEvidence,
+  })) {
+    throw shutdown.error
+  }
+  console.warn(JSON.stringify({
+    event: 'desktop_e2e_windows_shell_wrapper_reaped_after_commit',
+    phase,
+  }))
 }
 
 try {
@@ -1736,6 +1783,8 @@ try {
     })
   })
   const annotationRequestStart = provider.requests.length
+  const annotationUserMessageStart = await page.locator('.msg-user').count()
+  const sentAnnotationStart = await page.getByTestId('sent-prompt-annotation').count()
   await page.locator('.chat-textarea').fill(ANNOTATION_MESSAGE)
   await dropNextChatSend(page)
   await submitChatComposer(page)
@@ -1751,8 +1800,18 @@ try {
   await waitForSettledTurn(page)
   assert.equal(
     await page.locator('.chat-textarea').inputValue(),
-    ANNOTATION_MESSAGE,
-    'a disconnected send must retain the user message for retry',
+    '',
+    'an unknown send must not duplicate the optimistic user message in the composer',
+  )
+  assert.equal(
+    await page.locator('.msg-user').count(),
+    annotationUserMessageStart,
+    'an unaccepted synthetic send must not leave a duplicate user message in history',
+  )
+  assert.equal(
+    await page.getByTestId('sent-prompt-annotation').count(),
+    sentAnnotationStart,
+    'unaccepted annotations must remain drafts instead of duplicating into history',
   )
   assert.equal(
     await page.locator('.chat-prompt-annotation-chip').count(),
@@ -1771,9 +1830,31 @@ try {
     0,
     'a disconnected send must not publish an acceptance event',
   )
-  evidence.annotationSendFailureRetained = true
+  evidence.annotationUnknownSendSettledWithoutDuplicates = true
 
   await submitChatComposer(page)
+  await page.waitForFunction(
+    () => window.__opensquillaV1ReplayedChatSendRequest !== null,
+    undefined,
+    { timeout: TIMEOUT_MS },
+  )
+  const replayedAnnotationRequests = await page.evaluate(() => ({
+    dropped: window.__opensquillaV1DroppedChatSendRequest,
+    replayed: window.__opensquillaV1ReplayedChatSendRequest,
+  }))
+  assert.ok(replayedAnnotationRequests.dropped, 'the dropped chat.send request must be captured')
+  assert.ok(replayedAnnotationRequests.replayed, 'the replayed chat.send request must be captured')
+  assert.deepEqual(
+    replayedAnnotationRequests.replayed.params,
+    replayedAnnotationRequests.dropped.params,
+    'the retry must replay the exact immutable chat.send params and request identity',
+  )
+  assert.equal(
+    replayedAnnotationRequests.replayed.params.clientRequestId,
+    replayedAnnotationRequests.dropped.params.clientRequestId,
+    'the retry must reuse the original clientRequestId',
+  )
+  evidence.annotationReplayIdentityMatched = true
   await waitFor(
     () => provider.requests.slice(annotationRequestStart)
       .some(payload => annotationToolNames(payload).length > 0),
@@ -1807,6 +1888,11 @@ try {
     timeout: TIMEOUT_MS,
   })
   assert.equal(
+    evidence.annotationAcceptanceEvents.length,
+    1,
+    'the exact replay must publish one annotation acceptance event',
+  )
+  assert.equal(
     await page.locator('.chat-prompt-annotation-chip').filter({ hasText: ANNOTATION_BODY }).count(),
     0,
     'accepted annotation must leave the composer',
@@ -1815,6 +1901,14 @@ try {
     await page.locator('.chat-prompt-annotation-chip').count(),
     0,
     'all accepted annotations must leave the composer together',
+  )
+  await waitFor(
+    async () => (
+      await page.locator('.msg-user').count() === annotationUserMessageStart + 1
+      && await page.getByTestId('sent-prompt-annotation').count() === sentAnnotationStart + 2
+    ),
+    'one accepted annotation user message with two unique annotations',
+    TIMEOUT_MS,
   )
   evidence.annotationModeExitedAfterAcceptance = true
   assert.match(await versionsTab.innerText(), /3/)
@@ -2074,7 +2168,7 @@ try {
   assert.equal(pageErrors.length, 0, `renderer page errors: ${pageErrors.join(' | ')}`)
   assert.equal(consoleErrors.length, 0, `renderer console errors: ${consoleErrors.join(' | ')}`)
 
-  await app.close()
+  await closeDesktopApp(app, 'restart-electron-shutdown')
   app = undefined
   activePage = undefined
   await delay(1_000)
@@ -2168,6 +2262,17 @@ try {
     }
   }
   if (runError) {
+    // Emit the product/test failure before any best-effort cleanup. A stranded
+    // Windows HTTP or Electron handle must never replace the actionable cause
+    // with the outer 15-minute case watchdog.
+    console.error(JSON.stringify({
+      ok: false,
+      phase: 'run-error-before-cleanup',
+      error: String(runError?.stack || runError),
+      isolationRoot,
+    }, null, 2))
+  }
+  if (runError) {
     try {
       failureEvidence = await captureFailureEvidence({
         app,
@@ -2189,7 +2294,8 @@ try {
   }
   try {
     if (app) {
-      await diagnosticCall('Electron shutdown', () => app.close(), 15_000)
+      await closeDesktopApp(app, 'final-electron-shutdown')
+      app = undefined
     }
   } catch (error) {
     const shutdownError = new Error(
@@ -2222,7 +2328,26 @@ try {
       app?.process()?.kill()
     } catch {}
   }
-  await provider?.close().catch(() => {})
+  try {
+    await provider?.close()
+  } catch (error) {
+    const providerShutdownError = new Error(
+      `Synthetic provider did not shut down cleanly: ${String(error?.message || error)}`,
+      { cause: error },
+    )
+    console.error(JSON.stringify({
+      ok: false,
+      phase: 'synthetic-provider-shutdown',
+      error: String(providerShutdownError.stack || providerShutdownError),
+      isolationRoot,
+    }, null, 2))
+    if (!runError) runError = providerShutdownError
+    else if (failureEvidence) {
+      failureEvidence.providerShutdownError = String(
+        providerShutdownError.stack || providerShutdownError,
+      )
+    }
+  }
   await delay(100)
   if (runError) {
     console.error(JSON.stringify({

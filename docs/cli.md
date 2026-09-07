@@ -6,7 +6,7 @@ automate OpenSquilla.
 Install the current release with the recommended integrations:
 
 ```sh
-uv tool install --python 3.12 "opensquilla[recommended] @ https://github.com/opensquilla/opensquilla/releases/download/v0.5.4/opensquilla-0.5.4-py3-none-any.whl"
+uv tool install --python 3.12 "opensquilla[recommended] @ https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.4/opensquilla-0.5.4-py3-none-any.whl"
 ```
 
 Run:
@@ -245,7 +245,7 @@ Raw config:
 
 ```sh
 opensquilla config get llm.provider
-opensquilla config set gateway.port 18791
+opensquilla config set port 18791
 ```
 
 More detail:
@@ -390,4 +390,4 @@ installs never delete your checkout.
 
 ---
 
-[Docs index](README.md) · [Product guide](../README.product.md) · [Improve this page](contributing-docs.md) · [Report a docs issue](https://github.com/opensquilla/opensquilla/issues/new?template=docs_report.yml)
+[Docs index](README.md) · [Product guide](../README.product.md) · [Improve this page](contributing-docs.md) · [Report a docs issue](https://github.com/TokenRhythm/opensquilla/issues/new?template=docs_report.yml)

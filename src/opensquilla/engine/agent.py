@@ -2186,14 +2186,6 @@ def _active_user_message_index_for_request(
     return None
 
 
-def _is_mid_budget_nudge_message(message: Message) -> bool:
-    return (
-        message.role == "user"
-        and isinstance(message.content, str)
-        and message.content.startswith(_MID_BUDGET_NO_DIFF_NUDGE_PREFIX)
-    )
-
-
 def _is_runtime_nudge_message(message: Message) -> bool:
     """Whether a message is a runtime-injected nudge, not conversation history.
 
@@ -3093,6 +3085,28 @@ class Agent:
                 session_key=session_key,
                 agent_id=getattr(tool_context, "agent_id", None) if tool_context else None,
             )
+
+    def tool_presentation_payload(self, tool_name: str) -> dict[str, Any]:
+        """Resolve public display metadata from the active tool surface."""
+
+        from opensquilla.tools.presentation import resolve_tool_presentation
+        from opensquilla.tools.types import ToolSpec
+
+        registered = self._tool_registry.get(tool_name) if self._tool_registry else None
+        if registered is not None:
+            spec = registered.spec
+        else:
+            definition = self._tool_definition_by_name.get(tool_name)
+            spec = ToolSpec(
+                name=tool_name,
+                description=(definition.description if definition else ""),
+                parameters=(
+                    dict(definition.input_schema.properties)
+                    if definition is not None
+                    else {}
+                ),
+            )
+        return resolve_tool_presentation(spec).to_payload()
 
     def _context_overflow_error(self) -> ErrorEvent:
         reason = self._last_compaction_refusal_reason
@@ -4766,35 +4780,6 @@ class Agent:
                 reason="projected_diagnostic_requires_retrieval",
             ),
         )
-
-    def _tokenjuice_tool_reduction(
-        self,
-        *,
-        tool_name: str,
-        content: str,
-        is_error: bool,
-        tool_use_id: str,
-        arguments: dict[str, Any] | None = None,
-        command: str | None = None,
-        cwd: str | None = None,
-        max_inline_chars: int | None = None,
-    ) -> str | None:
-        reduction = reduce_tool_result_with_tokenjuice(
-            tool_name=tool_name,
-            content=content,
-            is_error=is_error,
-            tool_use_id=tool_use_id,
-            arguments=arguments,
-            command=command,
-            cwd=cwd,
-            max_inline_chars=self._tokenjuice_max_inline_chars(max_inline_chars),
-        )
-        if reduction is None:
-            return None
-        self.config.metadata["tool_projection_backend"] = "tokenjuice"
-        if reduction.reducer:
-            self.config.metadata["tool_projection_tokenjuice_reducer"] = reduction.reducer
-        return reduction.inline_text
 
     def _semantic_tool_result_projection_skip_reason(
         self,
@@ -18459,11 +18444,6 @@ class Agent:
         return Agent._filter_ignored_porcelain_status(status, gitlink_paths)
 
     @staticmethod
-    def _workspace_gitlink_paths(workspace_dir: Path) -> set[str]:
-        _state, paths = Agent._workspace_gitlink_paths_observed(workspace_dir)
-        return paths
-
-    @staticmethod
     def _workspace_gitlink_paths_observed(
         workspace_dir: Path,
     ) -> tuple[GitRunState, set[str]]:
@@ -18480,10 +18460,6 @@ class Agent:
             if len(parts) == 4 and parts[0] == "160000":
                 paths.add(_normalize_workspace_relative_path(parts[3]))
         return paths
-
-    def _workspace_ignored_diff_paths(self, workspace_dir: Path) -> set[str]:
-        _state, ignored = self._workspace_ignored_diff_paths_observed(workspace_dir)
-        return ignored
 
     def _workspace_ignored_diff_paths_observed(
         self,
@@ -19029,11 +19005,6 @@ class Agent:
         )
         return suspicious_name or suspicious_content
 
-    def _tool_call_targets_workspace_path(self, tc: ToolCall) -> bool:
-        if tc.tool_name not in _WORKSPACE_EDIT_TOOL_NAMES:
-            return False
-        return self._workspace_edit_gate_edit_block_detail(tc) is None
-
     def _workspace_edit_gate_allows_recovery_read(
         self,
         tc: ToolCall,
@@ -19046,9 +19017,6 @@ class Agent:
             return False
         resolved = self._resolve_workspace_path_candidate(raw_path)
         return resolved is not None and str(resolved) in recovery_read_paths
-
-    def _workspace_edit_gate_apply_patch_error_allows_read(self, result: ToolResult) -> bool:
-        return self._workspace_edit_gate_edit_error_allows_read(result)
 
     def _workspace_edit_gate_edit_error_allows_read(self, result: ToolResult) -> bool:
         if not result.is_error:
@@ -23214,6 +23182,8 @@ class Agent:
             )
         else:
             self._tool_failure_loop_counts.pop(failure_signature, None)
+            if tc.tool_name == "tool_search":
+                self._sync_progressive_tool_definitions()
             if tc.tool_name in {
                 "apply_patch",
                 "background_process",
@@ -23226,6 +23196,30 @@ class Agent:
             }:
                 self._tool_failure_loop_counts.clear()
         return result
+
+    def _sync_progressive_tool_definitions(self) -> None:
+        """Expose successful tool_search matches on the next provider call."""
+
+        ctx = self._tool_context
+        registry = self._tool_registry
+        if ctx is None or registry is None or not ctx.disclosed_tool_names:
+            return
+        authorized = ctx.authorized_tool_names or frozenset()
+        existing = {definition.name for definition in self.tool_definitions}
+        requested = set(ctx.disclosed_tool_names) & set(authorized) - existing
+        if not requested:
+            return
+        definitions = {
+            definition.name: definition
+            for definition in registry.to_tool_definitions(ctx)
+            if definition.name in requested
+        }
+        for name in sorted(requested):
+            definition = definitions.get(name)
+            if definition is None:
+                continue
+            self.tool_definitions.append(definition)
+            self._tool_definition_by_name[name] = definition
 
     def _matched_meta_skill_name_from_metadata(self) -> str | None:
         metadata = self.config.metadata or {}
@@ -24754,6 +24748,14 @@ class Agent:
             call_kind="subagent.chat",
         )
         parent_ctx = current_tool_context.get() or self._tool_context
+        parent_authorized_tool_names = getattr(
+            parent_ctx,
+            "authorized_tool_names",
+            None,
+        )
+        parent_disclosed_tool_names = set(
+            getattr(parent_ctx, "disclosed_tool_names", set()) or set()
+        )
         parent_run_context = getattr(parent_ctx, "sandbox_run_context", None)
         if isinstance(parent_run_context, RunContext):
             parent_run_context = run_context_for_subagent(parent_run_context)
@@ -24827,6 +24829,12 @@ class Agent:
             channel_id=f"subagent:{parent_session_key}",
             sender_id=parent_session_key,
             denied_tools=set(SUBAGENT_TOOL_DENY),
+            allowed_tools=(
+                set(parent_authorized_tool_names)
+                if parent_authorized_tool_names is not None
+                else None
+            ),
+            disclosed_tool_names=parent_disclosed_tool_names - set(SUBAGENT_TOOL_DENY),
             run_mode=parent_run_mode,
             sandbox_mounts=parent_sandbox_mounts,
             sandbox_run_context=parent_run_context,
@@ -24849,6 +24857,18 @@ class Agent:
                 else None
             ),
         )
+        if self._tool_registry is not None and parent_authorized_tool_names is not None:
+            from opensquilla.tools.filter import filter_tools
+
+            child_authorized_definitions = filter_tools(
+                self._tool_registry.to_tool_definitions(subagent_ctx),
+                allow=subagent_ctx.allowed_tools,
+                deny=subagent_ctx.denied_tools,
+            )
+            filtered_defs = self._tool_registry.to_model_tool_definitions(
+                child_authorized_definitions,
+                subagent_ctx,
+            )
         self._prepare_subagent_execution_task(
             spec,
             execution_id=child_execution_id,
@@ -25038,6 +25058,7 @@ class Agent:
             tool_definitions=filtered_defs,
             tool_handler=_subagent_tool_handler,
             subagent_manager=SubagentManager(spawn_depth=depth),
+            tool_registry=self._tool_registry,
             tool_context=subagent_ctx,
             usage_event_sink=self._usage_event_sink,
             usage_execution_context=child_usage_context,
