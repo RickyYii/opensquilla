@@ -52,6 +52,7 @@ from opensquilla.engine.types import (
     TextDeltaEvent,
     ThinkingEvent,
     ToolResultEvent,
+    ToolUseEndEvent,
     ToolUseStartEvent,
     WarningEvent,
 )
@@ -65,6 +66,43 @@ from opensquilla.tools.types import ToolContext
 # ---------------------------------------------------------------------------
 # Recording fakes
 # ---------------------------------------------------------------------------
+
+
+def test_tool_presentation_enrichment_is_best_effort() -> None:
+    event = ToolUseStartEvent(tool_use_id="tool-1", tool_name="read_file")
+    presentation = {
+        "category": "file_read",
+        "primaryArguments": ["path"],
+        "argumentDisplay": "primary",
+        "lifecycleDisplay": "boundary",
+    }
+
+    enriched = StreamConsumerStage._with_tool_presentation(
+        event,
+        SimpleNamespace(tool_presentation_payload=lambda _name: presentation),
+    )
+
+    assert enriched is not event
+    assert enriched.tool_presentation == presentation
+
+
+def test_tool_presentation_enrichment_never_breaks_execution() -> None:
+    event = ToolUseStartEvent(tool_use_id="tool-1", tool_name="read_file")
+
+    def fail(_name: str) -> dict[str, Any]:
+        raise ValueError("invalid presentation rule")
+
+    enriched = StreamConsumerStage._with_tool_presentation(
+        event,
+        SimpleNamespace(tool_presentation_payload=fail),
+    )
+
+    assert enriched.tool_presentation == {
+        "category": "generic",
+        "primaryArguments": [],
+        "argumentDisplay": "primary",
+        "lifecycleDisplay": "boundary",
+    }
 
 
 @dataclass
@@ -128,6 +166,8 @@ class _RecordingCompactionPersist:
         source_preimage: tuple[tuple[Any, ...], ...] | None = None,
         source_boundary_message_id: str | None = None,
         source_boundary_entry_id: int | None = None,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
     ) -> bool | None:
         self.calls.append(
             {
@@ -149,6 +189,8 @@ class _RecordingCompactionPersist:
                 "source_preimage": source_preimage,
                 "source_boundary_message_id": source_boundary_message_id,
                 "source_boundary_entry_id": source_boundary_entry_id,
+                "expected_session_id": expected_session_id,
+                "expected_session_epoch": expected_session_epoch,
             }
         )
         if self.raises is not None:
@@ -255,6 +297,8 @@ def _make_input(
     compaction_source_preimage: tuple[tuple[Any, ...], ...] | None = None,
     compaction_source_boundary_message_id: str | None = None,
     compaction_source_boundary_entry_id: int | None = None,
+    expected_session_id: str | None = None,
+    expected_session_epoch: int | None = None,
     execution_context: TurnExecutionContext | None = None,
 ) -> StreamConsumerStageInput:
     return StreamConsumerStageInput(
@@ -284,6 +328,8 @@ def _make_input(
             compaction_source_boundary_message_id
         ),
         compaction_source_boundary_entry_id=compaction_source_boundary_entry_id,
+        expected_session_id=expected_session_id,
+        expected_session_epoch=expected_session_epoch,
         input_mode=input_mode,
         execution_context=execution_context,
     )
@@ -779,6 +825,42 @@ def test_tool_use_start_handler_flushes_text_and_appends_segment() -> None:
     ]
     assert state.current_text_parts == []
     assert state.final_text_parts == ["pre"]  # unchanged when not synthetic
+
+
+@pytest.mark.asyncio
+async def test_tool_use_end_persists_input_before_execution_result() -> None:
+    state = _make_state()
+    presentation = {
+        "category": "file_read",
+        "primaryArguments": ["path"],
+        "argumentDisplay": "primary",
+        "lifecycleDisplay": "boundary",
+    }
+    stage, _recordings = _make_stage(
+        agent_run=_RecordingAgentRun(
+            events=[
+                ToolUseStartEvent(tool_use_id="read-1", tool_name="read_file"),
+                ToolUseEndEvent(
+                    tool_use_id="read-1",
+                    tool_name="read_file",
+                    arguments={"path": "src/app.py", "offset": 500},
+                    tool_presentation=presentation,
+                ),
+            ]
+        )
+    )
+
+    await _drain(stage, _make_input(state=state))
+
+    assert state.turn_segments == [
+        {
+            "type": "tool_use",
+            "tool_use_id": "read-1",
+            "name": "read_file",
+            "input": {"path": "src/app.py", "offset": 500},
+            "tool_presentation": presentation,
+        }
+    ]
 
 
 def test_tool_result_handler_projects_large_write_file_arguments() -> None:
@@ -1604,6 +1686,8 @@ async def test_compaction_handler_runs_persist_snapshot_prompt_in_order() -> Non
         compaction_source_preimage=source_preimage,
         compaction_source_boundary_message_id="source-boundary",
         compaction_source_boundary_entry_id=7,
+        expected_session_id="session-admitted",
+        expected_session_epoch=7,
     )
     await handler.handle(
         CompactionEvent(
@@ -1623,6 +1707,8 @@ async def test_compaction_handler_runs_persist_snapshot_prompt_in_order() -> Non
     assert persist.calls[0]["source_preimage"] is source_preimage
     assert persist.calls[0]["source_boundary_message_id"] == "source-boundary"
     assert persist.calls[0]["source_boundary_entry_id"] == 7
+    assert persist.calls[0]["expected_session_id"] == "session-admitted"
+    assert persist.calls[0]["expected_session_epoch"] == 7
     assert len(snapshot.calls) == 1
     assert len(prompt.calls) == 1
 

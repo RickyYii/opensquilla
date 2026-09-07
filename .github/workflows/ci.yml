@@ -108,6 +108,9 @@ jobs:
             echo "- Artifact: \`${ARTIFACT_NAME}\`"
             echo "- Queue base/head/tree: \`${QUEUE_BASE_SHA}\` / \`${QUEUE_HEAD_SHA}\` / \`${QUEUE_TREE_SHA}\`"
             echo "- Combined-tree domain smokes: \`${COMBINED_SMOKE_SUITES}\`"
+            if [[ "${REASON_CODE}" == "tree_mismatch" ]]; then
+              echo "- Fast-path note: the PR evidence does not match this queue tree, so this entry runs the full fail-closed matrix. If main advanced, refresh the PR against the latest main and wait for a new green PR CI run before requeueing. Reuse is always decided against the future entry's exact base and tree."
+            fi
             if [[ -n "${SOURCE_RUN_ID}" ]]; then
               echo "- Source run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN_ID}"
             fi
@@ -167,9 +170,15 @@ jobs:
               if [[ "${CI_OPTIMIZATION_MODE}" == "legacy" ]]; then
                 printf '.ci/run-all\n' > "${changed_files}"
               else
-                git diff --no-renames --name-only \
-                  "${{ github.event.pull_request.base.sha }}" \
-                  "${{ github.event.pull_request.head.sha }}" > "${changed_files}"
+                base_sha="${{ github.event.pull_request.base.sha }}"
+                head_sha="${{ github.event.pull_request.head.sha }}"
+                if git diff --merge-base --no-renames --name-only \
+                  "${base_sha}" "${head_sha}" -- > "${changed_files}"; then
+                  echo "Planning PR-owned changes from the merge base."
+                else
+                  echo "Unable to derive the PR-owned change set; running the full fail-closed matrix." >&2
+                  printf '.ci/run-all\n' > "${changed_files}"
+                fi
               fi
               ;;
             merge_group)
@@ -319,7 +328,7 @@ jobs:
       - name: Verify generated dist is not tracked
         shell: bash
         run: |
-          tracked="$(git ls-files 'src/opensquilla/gateway/static/dist/**')"
+          tracked="$(git ls-files 'opensquilla-webui/dist/**' 'src/opensquilla/gateway/static/dist/**')"
           if [[ -n "${tracked}" ]]; then
             echo "ERROR: generated Web UI dist must not be committed:" >&2
             printf '%s\n' "${tracked}" >&2
@@ -334,11 +343,15 @@ jobs:
           # strips harmless Finder metadata before the manifest is written.
           printf 'CI-only Finder metadata\n' > public/.DS_Store
           npm run build:artifact
-          if [[ -e ../src/opensquilla/gateway/static/dist/.DS_Store ]]; then
+          if [[ -e dist/.DS_Store || -e ../src/opensquilla/gateway/static/dist/.DS_Store ]]; then
             echo "ERROR: Finder metadata survived WebUI artifact normalization" >&2
             exit 1
           fi
           npm run verify:release-dist
+
+      - name: Verify staged backend copy
+        working-directory: opensquilla-webui
+        run: node scripts/stage-dist.mjs --check
 
       - name: Upload verified frontend artifact
         uses: actions/upload-artifact@v4
@@ -346,7 +359,7 @@ jobs:
           # Stable across rerun attempts: "re-run failed jobs" does not rerun
           # an already-successful producer, so consumers must reuse its name.
           name: opensquilla-webui-dist
-          path: src/opensquilla/gateway/static/dist/
+          path: opensquilla-webui/dist/
           if-no-files-found: error
           # GitHub permits reruns for 30 days; keep the producer artifact for
           # the full window so a failed-only consumer rerun can still reuse it.
@@ -372,10 +385,9 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: opensquilla-webui-dist
-          path: src/opensquilla/gateway/static/dist/
+          path: opensquilla-webui/dist/
 
       - name: Set up Node.js
-        if: ${{ contains(fromJSON(needs.plan-ci.outputs.required_suites), 'frontend-validation') }}
         uses: actions/setup-node@v4
         with:
           node-version-file: opensquilla-webui/.node-version
@@ -386,6 +398,59 @@ jobs:
         if: ${{ contains(fromJSON(needs.plan-ci.outputs.required_suites), 'frontend-validation') }}
         working-directory: opensquilla-webui
         run: npm ci
+
+      - name: Stage verified frontend artifact for Python consumers
+        working-directory: opensquilla-webui
+        run: node scripts/stage-dist.mjs
+
+      - name: Set up Python for Contract generation
+        if: ${{ contains(fromJSON(needs.plan-ci.outputs.required_suites), 'frontend-validation') }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up uv for Contract generation
+        if: ${{ contains(fromJSON(needs.plan-ci.outputs.required_suites), 'frontend-validation') }}
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install pinned Contract generators
+        if: ${{ contains(fromJSON(needs.plan-ci.outputs.required_suites), 'frontend-validation') }}
+        run: uv sync --only-group dev --frozen
+
+      - name: Verify deterministic Contract generation
+        if: ${{ contains(fromJSON(needs.plan-ci.outputs.required_suites), 'frontend-validation') }}
+        shell: bash
+        run: |
+          uv run --no-sync python scripts/contracts/generate_gateway_contracts.py --check
+          uv run --no-sync python scripts/contracts/generate_gateway_contracts.py --verify-determinism
+
+      - name: Run real Gateway Contract toolchain integration
+        if: ${{ contains(fromJSON(needs.plan-ci.outputs.required_suites), 'frontend-validation') }}
+        env:
+          OPENSQUILLA_RUN_CONTRACT_TOOLCHAIN_INTEGRATION: "1"
+          PYTHONPATH: "${{ github.workspace }}:${{ github.workspace }}/src"
+        run: >-
+          uv run --no-sync pytest -q
+          --confcutdir=tests/contracts
+          tests/contracts
+
+      - name: Write Linux Gateway Contract hash manifest
+        if: ${{ contains(fromJSON(needs.plan-ci.outputs.required_suites), 'frontend-validation') }}
+        run: >-
+          uv run --no-sync python scripts/contracts/generate_gateway_contracts.py
+          --hash-manifest "${RUNNER_TEMP}/gateway-contract-hashes.json"
+
+      - name: Upload Linux Gateway Contract hash manifest
+        if: ${{ contains(fromJSON(needs.plan-ci.outputs.required_suites), 'frontend-validation') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: gateway-contract-hashes-linux
+          path: ${{ runner.temp }}/gateway-contract-hashes.json
+          if-no-files-found: error
+          retention-days: 7
+          overwrite: true
 
       - name: Run frontend type checks
         if: ${{ contains(fromJSON(needs.plan-ci.outputs.required_suites), 'frontend-validation') }}
@@ -441,7 +506,165 @@ jobs:
           fi
           python scripts/verify_webui_artifact.py \
             --forbid-personal-bgm \
+            --dist src/opensquilla/gateway/static/dist \
             --wheel "${wheels[0]}"
+
+  gateway-contract-verification-linux:
+    name: Complete Gateway Contract verification (Linux)
+    needs: [plan-ci]
+    if: ${{ always() && needs.plan-ci.result == 'success' && contains(fromJSON(needs.plan-ci.outputs.required_suites), 'frontend-validation') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: opensquilla-webui/.node-version
+          cache: npm
+          cache-dependency-path: opensquilla-webui/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: opensquilla-webui
+        run: npm ci
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install pinned Contract generators
+        run: uv sync --only-group dev --frozen
+
+      - name: Verify every Contract role in a separate output tree
+        shell: bash
+        env:
+          NODE_PATH: ${{ github.workspace }}/opensquilla-webui/node_modules
+        run: |
+          npm --prefix opensquilla-webui run test:contract-tooling
+          verification_root="$(mktemp -d "${RUNNER_TEMP}/gateway-verification.XXXXXX")"
+          uv run --no-sync python scripts/contracts/generate_gateway_contracts.py --write --profile verification --output-root "${verification_root}"
+          uv run --no-sync python scripts/contracts/generate_gateway_contracts.py --verify-determinism --profile verification --output-root "${verification_root}"
+          node scripts/contracts/verify_gateway_validator_profiles.mjs --verification-root "${verification_root}"
+          uv run --no-sync python scripts/contracts/generate_gateway_contracts.py --hash-manifest "${RUNNER_TEMP}/gateway-contract-verification-hashes.json" --profile verification --output-root "${verification_root}"
+
+      - name: Upload Linux verification hash manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: gateway-contract-verification-hashes-linux
+          path: ${{ runner.temp }}/gateway-contract-verification-hashes.json
+          if-no-files-found: error
+          retention-days: 7
+          overwrite: true
+
+  gateway-contract-windows:
+    name: Gateway Contract determinism (Windows)
+    needs: [plan-ci, frontend-check, gateway-contract-verification-linux]
+    if: >-
+      ${{ always()
+          && needs.plan-ci.result == 'success'
+          && needs.frontend-check.result == 'success'
+          && needs.gateway-contract-verification-linux.result == 'success'
+          && contains(fromJSON(needs.plan-ci.outputs.required_suites), 'frontend-validation') }}
+    runs-on: windows-latest
+    # Real-toolchain generation scales with the complete Contract inventory.
+    # Keep the full Windows check, determinism replay, tests, and cross-OS hash
+    # comparison within one bounded job instead of weakening the gate.
+    timeout-minutes: 60
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: opensquilla-webui/.node-version
+          cache: npm
+          cache-dependency-path: opensquilla-webui/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: opensquilla-webui
+        run: npm ci
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install pinned Contract generators
+        run: uv sync --only-group dev --frozen
+
+      - name: Verify Windows Contract generation and real toolchain
+        env:
+          OPENSQUILLA_RUN_CONTRACT_TOOLCHAIN_INTEGRATION: "1"
+          PYTHONPATH: "${{ github.workspace }};${{ github.workspace }}/src"
+        run: |
+          uv run --no-sync python scripts/contracts/generate_gateway_contracts.py --check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          uv run --no-sync python scripts/contracts/generate_gateway_contracts.py --verify-determinism
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          uv run --no-sync pytest -q --confcutdir=tests/contracts tests/contracts
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Verify every Windows Contract role in a separate output tree
+        shell: pwsh
+        env:
+          NODE_PATH: ${{ github.workspace }}/opensquilla-webui/node_modules
+        run: |
+          npm --prefix opensquilla-webui run test:contract-tooling
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $verificationRoot = Join-Path $env:RUNNER_TEMP ("gateway-verification-" + [guid]::NewGuid())
+          uv run --no-sync python scripts/contracts/generate_gateway_contracts.py --write --profile verification --output-root $verificationRoot
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          uv run --no-sync python scripts/contracts/generate_gateway_contracts.py --verify-determinism --profile verification --output-root $verificationRoot
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node scripts/contracts/verify_gateway_validator_profiles.mjs --verification-root $verificationRoot
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $verificationManifest = Join-Path $env:RUNNER_TEMP "gateway-contract-verification-hashes-windows.json"
+          uv run --no-sync python scripts/contracts/generate_gateway_contracts.py --hash-manifest $verificationManifest --profile verification --output-root $verificationRoot
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Download Linux Gateway Contract hash manifest
+        uses: actions/download-artifact@v4
+        with:
+          name: gateway-contract-hashes-linux
+          path: ${{ runner.temp }}/gateway-contract-hashes-linux
+
+      - name: Compare Linux and Windows Contract hashes
+        shell: pwsh
+        run: |
+          $windowsManifest = Join-Path $env:RUNNER_TEMP "gateway-contract-hashes-windows.json"
+          $linuxManifest = Join-Path $env:RUNNER_TEMP "gateway-contract-hashes-linux/gateway-contract-hashes.json"
+          uv run --no-sync python scripts/contracts/generate_gateway_contracts.py --hash-manifest $windowsManifest
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          uv run --no-sync python scripts/contracts/generate_gateway_contracts.py --compare-hash-manifests $linuxManifest $windowsManifest
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Download Linux verification hash manifest
+        uses: actions/download-artifact@v4
+        with:
+          name: gateway-contract-verification-hashes-linux
+          path: ${{ runner.temp }}/gateway-contract-verification-hashes-linux
+
+      - name: Compare Linux and Windows verification hashes
+        shell: pwsh
+        run: |
+          $windowsManifest = Join-Path $env:RUNNER_TEMP "gateway-contract-verification-hashes-windows.json"
+          $linuxManifest = Join-Path $env:RUNNER_TEMP "gateway-contract-verification-hashes-linux/gateway-contract-verification-hashes.json"
+          uv run --no-sync python scripts/contracts/generate_gateway_contracts.py --compare-hash-manifests $linuxManifest $windowsManifest
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
   webui-chat-recovery:
     name: WebUI chat recovery
@@ -461,7 +684,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: opensquilla-webui-dist
-          path: src/opensquilla/gateway/static/dist/
+          path: opensquilla-webui/dist/
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -486,6 +709,10 @@ jobs:
       - name: Install frontend dependencies
         working-directory: opensquilla-webui
         run: npm ci
+
+      - name: Stage verified frontend artifact for Gateway
+        working-directory: opensquilla-webui
+        run: node scripts/stage-dist.mjs
 
       - name: Resolve Playwright browser revision
         id: playwright-browser
@@ -520,6 +747,7 @@ jobs:
           composer-paste.spec.ts
           history-hydration.spec.ts
           session-created-card.spec.ts
+          session-switch-transport.spec.ts
           goal-mode.spec.ts
           queue-steer.spec.ts
           share.spec.ts
@@ -1145,7 +1373,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: opensquilla-webui-dist
-          path: src/opensquilla/gateway/static/dist/
+          path: opensquilla-webui/dist/
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -1166,9 +1394,13 @@ jobs:
             desktop/electron/package-lock.json
             opensquilla-webui/package-lock.json
 
+      - name: Stage verified frontend artifact for Desktop
+        working-directory: opensquilla-webui
+        run: node scripts/stage-dist.mjs
+
       - name: Verify downloaded frontend artifact on consumer OS
         shell: bash
-        run: node opensquilla-webui/scripts/verify-dist.mjs src/opensquilla/gateway/static/dist
+        run: node opensquilla-webui/scripts/verify-dist.mjs opensquilla-webui/dist
 
       - name: Restore Electron binary cache
         id: electron-cache
@@ -1330,8 +1562,8 @@ jobs:
                   "os": "Windows",
                   "cases": {"desktop-cleanup-flow"},
                   "pattern": re.compile(
-                      r"^Error: Timed out waiting for post-exit delete-all helper completion\."
-                      r"; pending synthetic targets: .+$",
+                      r"^Error: Timed out waiting for post-exit delete-all helper completion:"
+                      r"\s*; pending synthetic targets: .+$",
                       re.MULTILINE,
                   ),
                   "companion_patterns": (),
@@ -1353,6 +1585,28 @@ jobs:
                   "companion_patterns": (
                       re.compile(
                           r"^\s*Traceback \(most recent call last\):\s*$",
+                          re.MULTILINE,
+                      ),
+                  ),
+              },
+              {
+                  "id": "windows-loopback-no-buffer-space-v1",
+                  "os": "Windows",
+                  "cases": {"offline-document-workbench-e2e"},
+                  "pattern": re.compile(
+                      r"^electronApplication\.evaluate: Error: "
+                      r"ERR_NO_BUFFER_SPACE \(-176\) loading "
+                      r"'http://127\.0\.0\.1:\d+/one'$",
+                      re.MULTILINE,
+                  ),
+                  # Chromium reports the socket-allocation failure first; the
+                  # outer Workbench runner then reports the exact failed child.
+                  # Remove only that wrapper so any separate assertion, crash,
+                  # or product error still blocks the retry below.
+                  "companion_patterns": (
+                      re.compile(
+                          r"^Error: .*test-native-workbench-v2-electron\.mjs "
+                          r"failed with exit code 1$",
                           re.MULTILINE,
                       ),
                   ),
@@ -1699,7 +1953,10 @@ jobs:
       - name: Run release packaging contract tests
         shell: bash
         run: |
+          command -v node
+          command -v pwsh
           uv run pytest \
+            tests/test_ci/test_upgrade_baselines.py \
             tests/test_scripts/test_build_wheelhouse_zip.py \
             tests/test_install_scripts.py \
             tests/test_root_start_scripts.py \
@@ -1824,6 +2081,8 @@ jobs:
       - readme-locale-check
       - frontend-artifact
       - frontend-check
+      - gateway-contract-verification-linux
+      - gateway-contract-windows
       - webui-chat-recovery
       - tui-check
       - desktop-check
@@ -1908,6 +2167,8 @@ jobs:
           RESULT_README_LOCALE: ${{ needs.readme-locale-check.result }}
           RESULT_FRONTEND_ARTIFACT: ${{ needs.frontend-artifact.result }}
           RESULT_FRONTEND: ${{ needs.frontend-check.result }}
+          RESULT_CONTRACT_VERIFICATION_LINUX: ${{ needs.gateway-contract-verification-linux.result }}
+          RESULT_CONTRACT_WINDOWS: ${{ needs.gateway-contract-windows.result }}
           RESULT_TUI: ${{ needs.tui-check.result }}
           RESULT_DESKTOP: ${{ needs.desktop-check.result }}
           RESULT_UBUNTU: ${{ needs.ubuntu-quality.result }}
