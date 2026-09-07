@@ -1,5 +1,5 @@
 import type { Attachment } from '@/types/chat'
-import type { ChatSendParams } from '@/types/rpc'
+import type { TurnSendParams } from '@/modules/turnCommands'
 
 const DATABASE_NAME = 'opensquilla-chat-pending-inputs'
 const DATABASE_VERSION = 2
@@ -47,7 +47,7 @@ export interface ResponseHandoffWalRecord {
   requestSessionKey: string
   clientRequestId: string
   clientMessageId: string
-  params: ChatSendParams
+  params: TurnSendParams
   composerText: string
   recoveryAttachments: Attachment[]
   /** A protocol-owned replay must never be restored into the user composer. */
@@ -105,7 +105,9 @@ export interface PendingInputWal {
   acceptHandoff?: (
     ownerRequestId: string,
     acceptedSessionKey: string,
-  ) => Promise<AcceptedHandoffCommit>
+    shouldAccept?: () => boolean,
+    handoffSignal?: AbortSignal,
+  ) => Promise<AcceptedHandoffCommit | null>
   deleteHandoff?: (ownerRequestId: string) => Promise<void>
   close: () => void
 }
@@ -178,7 +180,7 @@ function isPendingInputWalRecord(value: unknown): value is PendingInputWalRecord
 function isResponseHandoffWalRecord(value: unknown): value is ResponseHandoffWalRecord {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false
   const record = value as Partial<ResponseHandoffWalRecord>
-  const params = record.params as Partial<ChatSendParams> | undefined
+  const params = record.params as Partial<TurnSendParams> | undefined
   return record.schemaVersion === 1
     && typeof record.ownerRequestId === 'string'
     && record.ownerRequestId.length > 0
@@ -465,48 +467,75 @@ class BrowserPendingInputWal implements PendingInputWal {
   async acceptHandoff(
     ownerRequestId: string,
     acceptedSessionKey: string,
-  ): Promise<AcceptedHandoffCommit> {
+    shouldAccept: () => boolean = () => true,
+    handoffSignal?: AbortSignal,
+  ): Promise<AcceptedHandoffCommit | null> {
+    if (!shouldAccept() || handoffSignal?.aborted) return null
     const database = await this.database()
+    if (!shouldAccept() || handoffSignal?.aborted) return null
     const transaction = database.transaction(
       [STORE_NAME, HANDOFF_STORE_NAME],
       'readwrite',
     )
+    let abortedByHandoff = false
+    const abortTransaction = () => {
+      abortedByHandoff = true
+      try {
+        transaction.abort()
+      } catch {
+        // oncomplete may already have won. Its promise continuation runs
+        // before a later navigation task can invalidate this epoch.
+      }
+    }
+    if (handoffSignal?.aborted) abortTransaction()
+    else handoffSignal?.addEventListener('abort', abortTransaction, { once: true })
     const handoffStore = transaction.objectStore(HANDOFF_STORE_NAME)
     const pendingStore = transaction.objectStore(STORE_NAME)
-    const rawHandoff = await requestResult(handoffStore.get(ownerRequestId))
-    if (!isResponseHandoffWalRecord(rawHandoff)) {
-      transaction.abort()
-      throw new Error('Response handoff no longer exists')
-    }
-    if (rawHandoff.walOwnerId && rawHandoff.state !== 'accepted') {
-      transaction.abort()
-      throw new Error('Response handoff is not durably accepted')
-    }
-    const handoff = cloneHandoffRecord({
-      ...rawHandoff,
-      state: 'accepted',
-      acceptedSessionKey,
-      updatedAt: Date.now(),
-    })
-    handoffStore.put(handoff)
-    const rawPending = await requestResult(pendingStore.getAll())
-    const records = (rawPending as unknown[])
-      .filter(isPendingInputWalRecord)
-      .filter(record => record.ownerRequestId === ownerRequestId)
-      .map(record => {
-        const next = cloneRecord({
-          ...record,
-          sessionKey: acceptedSessionKey,
-          ownerRequestId: undefined,
-          state: 'saving',
-          walRevision: (record.walRevision ?? 1) + 1,
-          updatedAt: Date.now(),
-        })
-        pendingStore.put(next)
-        return next
+    try {
+      const rawHandoff = await requestResult(handoffStore.get(ownerRequestId))
+      if (!isResponseHandoffWalRecord(rawHandoff)) {
+        transaction.abort()
+        throw new Error('Response handoff no longer exists')
+      }
+      if (rawHandoff.walOwnerId && rawHandoff.state !== 'accepted') {
+        transaction.abort()
+        throw new Error('Response handoff is not durably accepted')
+      }
+      const rawPending = await requestResult(pendingStore.getAll())
+      if (!shouldAccept() || handoffSignal?.aborted) {
+        abortTransaction()
+        return null
+      }
+      const handoff = cloneHandoffRecord({
+        ...rawHandoff,
+        state: 'accepted',
+        acceptedSessionKey,
+        updatedAt: Date.now(),
       })
-    await transactionDone(transaction)
-    return { handoff, records }
+      handoffStore.put(handoff)
+      const records = (rawPending as unknown[])
+        .filter(isPendingInputWalRecord)
+        .filter(record => record.ownerRequestId === ownerRequestId)
+        .map(record => {
+          const next = cloneRecord({
+            ...record,
+            sessionKey: acceptedSessionKey,
+            ownerRequestId: undefined,
+            state: 'saving',
+            walRevision: (record.walRevision ?? 1) + 1,
+            updatedAt: Date.now(),
+          })
+          pendingStore.put(next)
+          return next
+        })
+      await transactionDone(transaction)
+      return { handoff, records }
+    } catch (error) {
+      if (abortedByHandoff || handoffSignal?.aborted || !shouldAccept()) return null
+      throw error
+    } finally {
+      handoffSignal?.removeEventListener('abort', abortTransaction)
+    }
   }
 
   async deleteHandoff(ownerRequestId: string): Promise<void> {

@@ -8,6 +8,7 @@ import {
 } from '@/lib/rpc'
 import type { DesktopGatewayConnection } from '@/platform/types'
 import { getPlatform } from '@/platform'
+import { recordRpcTransportDiag } from '@/utils/chat/sessionNavigationDiag'
 
 const WS_URL_KEY = 'opensquilla.wsUrl'
 const WS_TOKEN_KEY = 'opensquilla.wsToken'
@@ -86,6 +87,10 @@ export const useRpcStore = defineStore('rpc', () => {
   const events = ref<string[]>([])
   const unavailableMethods = ref<Set<string>>(new Set())
   const error = ref<string | null>(null)
+  // RpcClient is stored as a class instance and several callbacks retain the
+  // raw object, so its private generation mutations are not Vue-reactive.
+  // Mirror the value explicitly at every transport/state boundary.
+  const connectionGeneration = ref(0)
   let desktopConnectionRevision = -1
   let desktopConnectionKey = ''
   let desktopAuthToken = ''
@@ -103,10 +108,10 @@ export const useRpcStore = defineStore('rpc', () => {
   })
   const canManageProjectWorkspaces = computed(() =>
     isLocalOwner.value
-    && supportsMethod('workspaces.list'))
+    && hasRpcMethod('workspaces.list'))
   const canChooseProject = computed(() =>
     canManageProjectWorkspaces.value
-    && supportsMethod('workspaces.open'))
+    && hasRpcMethod('workspaces.open'))
 
   function clearConnectionIdentity(): void {
     policy.value = null
@@ -164,6 +169,7 @@ export const useRpcStore = defineStore('rpc', () => {
     client.value = rpc
 
     rpc.on('_state', (s: 'disconnected' | 'connecting' | 'connected') => {
+      connectionGeneration.value = rpc.connectionGeneration
       state.value = s
       if (s !== 'connected') {
         clearConnectionIdentity()
@@ -188,6 +194,11 @@ export const useRpcStore = defineStore('rpc', () => {
 
     rpc.on('_gap', (detail: unknown) => {
       console.warn('[RPC] Sequence gap detected:', detail)
+    })
+
+    rpc.on('_transport', (detail: unknown) => {
+      connectionGeneration.value = rpc.connectionGeneration
+      recordRpcTransportDiag(detail)
     })
 
     const gatewayPlatform = getPlatform().gateway
@@ -240,15 +251,15 @@ export const useRpcStore = defineStore('rpc', () => {
     clearConnectionIdentity()
   }
 
-  function supportsMethod(method: string): boolean {
+  function hasRpcMethod(method: string): boolean {
     return methods.value.includes(method) && !unavailableMethods.value.has(method)
   }
 
-  function supportsEvent(event: string): boolean {
+  function hasRpcEvent(event: string): boolean {
     return events.value.includes(event)
   }
 
-  function markMethodUnavailable(method: string): void {
+  function rememberUnsupportedMethod(method: string): void {
     if (!method) return
     unavailableMethods.value = new Set([...unavailableMethods.value, method])
   }
@@ -277,13 +288,20 @@ export const useRpcStore = defineStore('rpc', () => {
     return client.value.on(event, handler)
   }
 
-  function waitForConnection(
+  function ready(
     timeoutMs?: number,
     signal?: AbortSignal,
     actions?: RpcConnectionWaitOptions,
   ): Promise<void> {
     if (!client.value) return Promise.reject(new Error('RPC client not initialized'))
-    return client.value.waitForConnection(timeoutMs, signal, actions)
+    return client.value.ready(timeoutMs, signal, actions)
+  }
+
+  function recoverConnectionGeneration(
+    expectedGeneration: number,
+    reason: string,
+  ): boolean {
+    return client.value?.recoverConnectionGeneration(expectedGeneration, reason) ?? false
   }
 
   return {
@@ -294,6 +312,7 @@ export const useRpcStore = defineStore('rpc', () => {
     methods,
     events,
     error,
+    connectionGeneration,
     isConnected,
     isConnecting,
     isLocalOwner,
@@ -303,11 +322,12 @@ export const useRpcStore = defineStore('rpc', () => {
     connect,
     applyLinkTokenFromUrl,
     disconnect,
-    supportsMethod,
-    supportsEvent,
-    markMethodUnavailable,
+    hasRpcMethod,
+    hasRpcEvent,
+    rememberUnsupportedMethod,
     call,
     on,
-    waitForConnection,
+    ready,
+    recoverConnectionGeneration,
   }
 })

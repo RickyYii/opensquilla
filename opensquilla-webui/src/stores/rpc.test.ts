@@ -8,12 +8,15 @@ const connectCalls: Array<{ url: string; token?: string }> = []
 const clients: Array<{
   emit: (event: string, ...args: unknown[]) => void
   disconnect: ReturnType<typeof vi.fn>
-  waitForConnection: ReturnType<typeof vi.fn>
+  ready: ReturnType<typeof vi.fn>
+  recoverConnectionGeneration: ReturnType<typeof vi.fn>
+  connectionGeneration: number
 }> = []
 
 vi.mock('@/lib/rpc', () => ({
   RpcClient: class {
     state = 'disconnected'
+    connectionGeneration = 0
     private listeners = new Map<string, Array<(...args: unknown[]) => void>>()
 
     constructor() {
@@ -22,6 +25,7 @@ vi.mock('@/lib/rpc', () => ({
 
     connect(url: string, token?: string) {
       connectCalls.push({ url, token })
+      this.connectionGeneration += 1
       this.state = 'connected'
       this.emit('_state', 'connected')
     }
@@ -43,7 +47,8 @@ vi.mock('@/lib/rpc', () => ({
       this.state = 'disconnected'
       this.emit('_state', 'disconnected')
     })
-    waitForConnection = vi.fn()
+    ready = vi.fn()
+    recoverConnectionGeneration = vi.fn(() => true)
     call = vi.fn()
   },
 }))
@@ -91,16 +96,34 @@ describe('rpc link-token bootstrap', () => {
     const controller = new AbortController()
     controller.abort()
     const abortError = new Error('aborted')
-    clients[0].waitForConnection.mockRejectedValueOnce(abortError)
+    clients[0].ready.mockRejectedValueOnce(abortError)
 
     await expect(
-      store.waitForConnection(123, controller.signal, { abortAction: 'reconnect' }),
+      store.ready(123, controller.signal, { abortAction: 'reconnect' }),
     ).rejects.toBe(abortError)
-    expect(clients[0].waitForConnection).toHaveBeenCalledWith(
+    expect(clients[0].ready).toHaveBeenCalledWith(
       123,
       controller.signal,
       { abortAction: 'reconnect' },
     )
+  })
+
+  it('forwards generation-fenced subscription recovery to the live client', () => {
+    const store = useRpcStore()
+    store.init()
+
+    expect(store.connectionGeneration).toBe(1)
+    expect(store.recoverConnectionGeneration(1, 'subscription release failed')).toBe(true)
+    expect(clients[0].recoverConnectionGeneration).toHaveBeenCalledWith(
+      1,
+      'subscription release failed',
+    )
+
+    // RpcClient callbacks mutate the raw class instance. A cached computed
+    // getter would stay at generation 1 and incorrectly fence later leases.
+    clients[0].connectionGeneration = 3
+    clients[0].emit('_state', 'connected')
+    expect(store.connectionGeneration).toBe(3)
   })
 
   it('reconnects with a URL token when an already-loaded app navigates to a token link', () => {
@@ -139,11 +162,11 @@ describe('rpc link-token bootstrap', () => {
     })
     expect(store.policy).toEqual({ allowedRunModes: ['full'] })
     expect(store.auth).toEqual({ principal: { isOwner: true } })
-    expect(store.supportsMethod('usage.query')).toBe(true)
-    expect(store.supportsEvent('session.event.turn_committed')).toBe(true)
+    expect(store.hasRpcMethod('usage.query')).toBe(true)
+    expect(store.hasRpcEvent('session.event.turn_committed')).toBe(true)
 
-    store.markMethodUnavailable('usage.query')
-    expect(store.supportsMethod('usage.query')).toBe(false)
+    store.rememberUnsupportedMethod('usage.query')
+    expect(store.hasRpcMethod('usage.query')).toBe(false)
 
     window.history.replaceState(null, '', '/control/?token=new-token')
 
@@ -171,15 +194,15 @@ describe('rpc link-token bootstrap', () => {
 
     expect(store.methods).toEqual(['usage.status'])
     expect(store.events).toEqual(['session.event.turn_committed'])
-    expect(store.supportsMethod('usage.status')).toBe(true)
-    expect(store.supportsMethod('usage.query')).toBe(false)
-    expect(store.supportsEvent('session.event.turn_committed')).toBe(true)
-    expect(store.supportsEvent('session.event.unknown')).toBe(false)
+    expect(store.hasRpcMethod('usage.status')).toBe(true)
+    expect(store.hasRpcMethod('usage.query')).toBe(false)
+    expect(store.hasRpcEvent('session.event.turn_committed')).toBe(true)
+    expect(store.hasRpcEvent('session.event.unknown')).toBe(false)
 
     clients[0].emit('_hello', {})
     expect(store.methods).toEqual([])
     expect(store.events).toEqual([])
-    expect(store.supportsEvent('session.event.turn_committed')).toBe(false)
+    expect(store.hasRpcEvent('session.event.turn_committed')).toBe(false)
   })
 
   it('derives project capabilities from the current Hello owner and methods', () => {
