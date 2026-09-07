@@ -47,8 +47,11 @@ def test_desktop_electron_release_config_matches_current_release() -> None:
     assert not re.search(r"(?<=\d)(?:a|b|rc)\d+$", package["version"])
     assert package["repository"] == {
         "type": "git",
-        "url": "https://github.com/opensquilla/opensquilla.git",
+        "url": "https://github.com/TokenRhythm/opensquilla.git",
     }
+    assert build["publish"] == [
+        {"provider": "github", "owner": "TokenRhythm", "repo": "opensquilla"}
+    ]
     assert build["appId"] == "ai.opensquilla.desktop"
     assert build["productName"] == "OpenSquilla"
     assert build["artifactName"] == "OpenSquilla-${version}-${os}-${arch}.${ext}"
@@ -204,7 +207,7 @@ fi
             "FAKE_RELEASE_STATE": json.dumps(
                 {"assets": [], "isDraft": draft, "isPrerelease": prerelease}
             ),
-            "GH_REPO": "opensquilla/opensquilla",
+            "GH_REPO": "TokenRhythm/opensquilla",
             "GH_TOKEN": "synthetic-test-token",
             "PATH": (
                 f"{fake_bin}{os.pathsep}{Path(sys.executable).parent}{os.pathsep}{env['PATH']}"
@@ -615,6 +618,7 @@ def test_release_workflow_gates_built_and_downloaded_installers_on_profile_reten
         "synthetic retained chat",
         "LONG_SESSION_MESSAGE_COUNT = 320",
         "agent:main:webchat:release-recovery-long-session",
+        "agent:main:webchat:release-recovery-switch-session",
     ):
         assert artifact in probe
     for helper in (mac_helper, windows_helper):
@@ -624,13 +628,14 @@ def test_release_workflow_gates_built_and_downloaded_installers_on_profile_reten
         assert "workspace" in helper
         assert "state" in helper
         assert "--label" in helper
-        assert "test-packaged-session-recovery.mjs" not in helper
-        assert "--session-key" not in helper
+        assert "test-packaged-session-recovery.mjs" in helper
+        assert "--session-key" in helper
+        assert "--switch-session-key" in helper
 
     assert "runtime/developer/darwin-arm64" in mac_helper
     assert "test ! -e \"${candidate_runtime}/developer\"" in mac_helper
     assert "resources\\runtime\\developer\\windows-x64" in windows_helper
-    assert "retained the v0.5.3 bundled developer runtimes" in windows_helper
+    assert "retained bundled developer runtimes" in windows_helper
 
     assert "test-packaged-update-banner.mjs" in windows_helper
     assert "if ($VerifyLongRunningUpdateBanner)" in windows_helper
@@ -665,6 +670,7 @@ def test_release_workflow_gates_built_and_downloaded_installers_on_profile_reten
         "composer.isEditable()",
         "sendButton.isDisabled()",
         "expectedLastMessage",
+        "healthyNavigationSocketIds.size",
         "socketCount > 1",
     ):
         assert contract in session_recovery_smoke
@@ -757,7 +763,7 @@ def test_release_workflow_prestages_draft_without_advancing_channels() -> None:
         "checkForUpdates()",
         "downloadUpdate()",
         "relaunchToUpdate()",
-        "installer reported success while the official v0.5.3 process remained live",
+        "installer reported success while the official v${baselineVersion} process remained live",
     ):
         assert contract in driver
 
@@ -1069,14 +1075,17 @@ def test_changelog_has_current_release_section_and_unreleased() -> None:
     assert "[Unreleased]" in text, "CHANGELOG.md must retain an [Unreleased] section"
 
 
-def test_readme_release_install_uses_latest_assets_and_pinned_alternative() -> None:
+def test_readme_release_install_uses_versioned_assets_and_pinned_wheel() -> None:
     readme = Path("README.md").read_text(encoding="utf-8")
 
-    assert f"OpenSquilla-{CURRENT_DESKTOP_VERSION}-mac-arm64.dmg" in readme
-    assert f"OpenSquilla-{CURRENT_DESKTOP_VERSION}-win-x64.exe" in readme
-    assert "versioned GitHub assets" in readme
-    assert "Alibaba Cloud OSS mirror" in readme
-    assert "Portable archives remain retired" in readme
+    assert (
+        f"releases/download/{CURRENT_TAG}/"
+        f"OpenSquilla-{CURRENT_DESKTOP_VERSION}-mac-arm64.dmg" in readme
+    )
+    assert (
+        f"releases/download/{CURRENT_TAG}/"
+        f"OpenSquilla-{CURRENT_DESKTOP_VERSION}-win-x64.exe" in readme
+    )
     assert "releases/latest/download/OpenSquilla-windows-x64-portable.zip" not in readme
     assert (
         f"releases/download/{CURRENT_TAG}/opensquilla-{CURRENT_VERSION}-py3-none-any.whl" in readme
@@ -1084,6 +1093,24 @@ def test_readme_release_install_uses_latest_assets_and_pinned_alternative() -> N
     assert "opensquilla-latest-py3-none-any.whl" not in readme
     assert "Python wheel installs use versioned wheel filenames" in readme
     assert "Release install commands use published GitHub release assets" in readme
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        Path("README.md"),
+        Path("README.zh-Hans.md"),
+        Path("README.ja.md"),
+        Path("README.fr.md"),
+        Path("README.de.md"),
+        Path("README.es.md"),
+    ],
+)
+def test_readmes_point_to_canonical_release_notes(path: Path) -> None:
+    text = path.read_text(encoding="utf-8")
+
+    assert "[`CHANGELOG.md`](CHANGELOG.md)" in text, path
+    assert "[`docs/releases/`](docs/releases/)" in text, path
 
 
 def test_all_readmes_default_install_paths_to_the_current_preview() -> None:
@@ -1110,7 +1137,7 @@ def test_all_readmes_default_install_paths_to_the_current_preview() -> None:
         assert f"OpenSquilla-{CURRENT_DESKTOP_VERSION}-win-x64.exe" in text, path
         assert all(url in text for url in oss_latest_assets), path
         assert wheel_url in text, path
-        assert "ghcr.io/opensquilla/opensquilla:latest" in text, path
+        assert "ghcr.io/tokenrhythm/opensquilla:latest" in text, path
         assert "0.5.0-Preview-2-Desktop" not in text, path
 
 

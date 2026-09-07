@@ -18,6 +18,10 @@ load_config = MODULE["load_config"]
 plan_changes = MODULE["plan_changes"]
 
 CONFIG_PATH = Path(".github/ci/suites.v1.json")
+TRUST_POLICY_PATH = Path(".github/ci/trust-policy.v1.json")
+MERGE_CRITICAL_INPUTS = json.loads(TRUST_POLICY_PATH.read_text(encoding="utf-8"))[
+    "merge_critical_inputs"
+]
 
 
 @pytest.fixture
@@ -62,7 +66,7 @@ def _platform_cells(plan: dict[str, Any], suite: str) -> set[tuple[str, str]]:
 def test_docs_only_plan_is_small_and_canonical(
     tmp_path: Path, suite_config: dict[str, Any]
 ) -> None:
-    plan = _plan(tmp_path, suite_config, "README.zh-Hans.md", "docs/ci.md")
+    plan = _plan(tmp_path, suite_config, "docs/architecture.md", "docs/ci.md")
 
     assert plan["required_suites"] == ["readme-locale", "workflow-lint"]
     assert plan["desktop_matrix"] == []
@@ -76,6 +80,33 @@ def test_docs_only_plan_is_small_and_canonical(
     assert set(plan["suite_execution_digests"]) == set(plan["required_suites"])
     assert json.loads(canonical_json(plan)) == plan
     assert " " not in canonical_json(plan)
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "README.md",
+        "README.zh-Hans.md",
+        "README.product.md",
+    ],
+)
+def test_root_readmes_select_release_packaging_contract(
+    tmp_path: Path,
+    suite_config: dict[str, Any],
+    path: str,
+) -> None:
+    plan = _plan(tmp_path, suite_config, path)
+
+    assert plan["required_suites"] == [
+        "readme-locale",
+        "release-packaging",
+        "workflow-lint",
+    ]
+    assert plan["desktop_matrix"] == []
+    assert plan["python_matrix"] == {"ubuntu": [], "windows": []}
+    assert plan["python_targets"] == []
+    assert plan["full_fallback"] is False
+    assert plan["reason_codes"] == ["docs_only", "packaging_changed"]
 
 
 def test_plan_and_digest_are_order_independent(
@@ -446,10 +477,109 @@ def test_generic_webui_change_does_not_wake_desktop_matrix(
     plan = _plan(tmp_path, suite_config, "opensquilla-webui/src/views/SettingsView.vue")
 
     assert plan["full_fallback"] is False
-    assert {"frontend", "webui-chat-recovery"} <= set(plan["required_suites"])
+    assert {
+        "frontend-artifact",
+        "frontend-validation",
+        "webui-chat-recovery",
+    } <= set(plan["required_suites"])
     assert "desktop-recovery-e2e" not in plan["required_suites"]
     assert plan["desktop_matrix"] == []
     assert plan["reason_codes"] == ["webui_changed"]
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "contracts/gateway/v4/compatibility-manifest.generated.json",
+        "contracts/gateway/v4/sandbox/sandbox-runtime-status.schema.json",
+        "contracts/gateway/v4/sessions/sessions-list.schema.json",
+        "contracts/gateway/v4/sessions/sessions-changed.schema.json",
+        "opensquilla-webui/src/contracts/generated/v4/sandboxRuntimeStatus.ts",
+        "opensquilla-webui/src/contracts/generated/v4/sessionsChanged.ts",
+        "scripts/contracts/generate_gateway_contracts.py",
+        "scripts/contracts/generate_sessions_list_contract.py",
+        "src/opensquilla/contracts/generated/v4/sandbox_runtime_status.py",
+        "src/opensquilla/contracts/generated/v4/sessions_list.py",
+        "src/opensquilla/contracts/generated/v4/sessions_changed.py",
+        "tests/contracts/test_gateway_contract_runner.py",
+        "tests/contracts/test_gateway_contract_toolchain_integration.py",
+        "tests/contracts/test_sandbox_runtime_contract.py",
+        "tests/contracts/test_sessions_list_contract.py",
+        "tests/contracts/test_sessions_changed_contract.py",
+        "tests/fixtures/contracts/gateway/v4/toolchain/toolchain-ping.schema.json",
+    ],
+)
+def test_gateway_contract_changes_run_deterministic_generation(
+    tmp_path: Path, suite_config: dict[str, Any], path: str
+) -> None:
+    plan = _plan(tmp_path, suite_config, path)
+
+    assert plan["full_fallback"] is False
+    assert {
+        "frontend-artifact",
+        "frontend-validation",
+        "python-targeted",
+    } <= set(
+        plan["required_suites"]
+    )
+    assert {
+        "tests/test_ci/test_architecture_import_contracts.py",
+        "tests/test_ci/test_rpc_architecture_contracts.py",
+    } <= set(plan["python_targets"])
+    assert plan["reason_codes"] == ["gateway_contract_changed"]
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "opensquilla-webui/scripts/lib/rpc-architecture-gate.mjs",
+        "opensquilla-webui/src/adapters/gateway/sessionConversationV4.ts",
+        "opensquilla-webui/src/modules/sessionConversation.ts",
+        "opensquilla-webui/src/platform/desktop.ts",
+        "opensquilla-webui/src/types/chat.ts",
+        "src/opensquilla/gateway/adapters/sandbox_runtime_contract.py",
+        "src/opensquilla/gateway/adapters/sessions_list_contract.py",
+    ],
+)
+def test_webui_boundary_changes_run_python_architecture_contracts(
+    tmp_path: Path,
+    suite_config: dict[str, Any],
+    path: str,
+) -> None:
+    plan = _plan(tmp_path, suite_config, path)
+
+    assert "python-targeted" in plan["required_suites"]
+    assert {
+        "tests/test_ci/test_architecture_import_contracts.py",
+        "tests/test_ci/test_rpc_architecture_contracts.py",
+    } <= set(plan["python_targets"])
+
+
+def test_webui_boundary_prefix_registry_is_explicit_and_current() -> None:
+    assert MODULE["_WEBUI_BOUNDARY_PREFIXES"] == (
+        "opensquilla-webui/scripts/lib/",
+        "opensquilla-webui/src/adapters/gateway/",
+        "opensquilla-webui/src/contracts/",
+        "opensquilla-webui/src/modules/",
+        "opensquilla-webui/src/platform/",
+        "opensquilla-webui/src/types/",
+        "src/opensquilla/contracts/",
+        "src/opensquilla/gateway/adapters/",
+    )
+
+
+def test_artifact_workbench_application_runs_full_python_architecture_suite(
+    tmp_path: Path,
+    suite_config: dict[str, Any],
+) -> None:
+    plan = _plan(
+        tmp_path,
+        suite_config,
+        "src/opensquilla/application/artifact_workbench.py",
+    )
+
+    assert "python-full" in plan["required_suites"]
+    assert plan["python_targets"] == ["tests"]
 
 
 def test_gateway_change_runs_browser_recovery_without_native_desktop(
@@ -457,7 +587,12 @@ def test_gateway_change_runs_browser_recovery_without_native_desktop(
 ) -> None:
     plan = _plan(tmp_path, suite_config, "src/opensquilla/gateway/app.py")
 
-    assert {"frontend", "python-targeted", "webui-chat-recovery"} <= set(
+    assert {
+        "frontend-artifact",
+        "python-targeted",
+        "skill-hub",
+        "webui-chat-recovery",
+    } <= set(
         plan["required_suites"]
     )
     assert "desktop-recovery-e2e" not in plan["required_suites"]
@@ -750,7 +885,6 @@ def test_managed_toolchain_domain_tests_retain_the_artifact_e2e_suite(
     ("path", "reason"),
     [
         (".github/workflows/ci.yml", "ci_policy_changed"),
-        ("uv.lock", "dependency_changed"),
         ("new-product-surface/config.bin", "unknown_path"),
         ("tests/unknown/test_workbench.py", "unknown_path"),
     ],
@@ -789,10 +923,9 @@ def test_windows_shard_metadata_does_not_invalidate_unrelated_suites(
     assert "python-targeted" in durations["required_suites"]
     assert durations["python_targets"] == ["tests/test_ci/test_windows_test_shards.py"]
     assert "scheduling_metadata_changed" in durations["reason_codes"]
-    assert assignments["full_fallback"] is False
-    assert "python-targeted" in assignments["required_suites"]
-    assert "windows-high-risk" in assignments["required_suites"]
-    assert "windows_shard_layout_changed" in assignments["reason_codes"]
+    assert assignments["full_fallback"] is True
+    assert assignments["required_suites"] == sorted(suite_config["full_suites"])
+    assert assignments["reason_codes"] == ["ci_policy_changed"]
 
 
 @pytest.mark.parametrize(
@@ -835,7 +968,419 @@ def test_frontend_artifact_consumer_plan_always_includes_its_producer(
     plan = _plan(tmp_path, suite_config, path)
 
     assert "desktop-recovery-e2e" in plan["required_suites"]
-    assert "frontend" in plan["required_suites"]
+    assert "frontend-artifact" in plan["required_suites"]
+
+
+@pytest.mark.parametrize("path", [".python-version", "pyproject.toml", "uv.lock"])
+def test_python_dependency_changes_select_reviewed_full_ecosystem_coverage(
+    tmp_path: Path, suite_config: dict[str, Any], path: str
+) -> None:
+    plan = _plan(tmp_path, suite_config, path)
+
+    assert plan["full_fallback"] is False
+    assert set(plan["required_suites"]) == {
+        "desktop-recovery-e2e",
+        "frontend-artifact",
+        "frontend-validation",
+        "macos-recovery",
+        "managed-toolchain",
+        "python-full",
+        "readme-locale",
+        "release-packaging",
+        "skill-hub",
+        "webui-chat-recovery",
+        "wheel-webui-roundtrip",
+        "windows-high-risk",
+        "workflow-lint",
+    }
+    assert plan["desktop_matrix"] == sorted(
+        suite_config["full_desktop_matrix"],
+        key=lambda cell: (cell["os"], cell["shard"]),
+    )
+    assert plan["python_matrix"] == suite_config["full_python_matrix"]
+    assert plan["python_targets"] == ["tests"]
+    assert _platform_cells(plan, "skill-hub") == {
+        ("ubuntu-latest", "default"),
+        ("macos-latest", "default"),
+        ("windows-latest", "default"),
+    }
+    assert "desktop-static" not in plan["required_suites"]
+    assert plan["reason_codes"] == ["python_dependency_changed"]
+
+    contract_inputs = set(
+        suite_config["suites"]["frontend-validation"]["execution_inputs"]
+    )
+    assert {".gitattributes", "pyproject.toml", "uv.lock"} <= contract_inputs
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "opensquilla-webui/package-lock.json",
+        "opensquilla-webui/packages/editor/package.json",
+    ],
+)
+def test_webui_dependency_changes_stay_in_webui_ecosystem(
+    tmp_path: Path, suite_config: dict[str, Any], path: str
+) -> None:
+    plan = _plan(tmp_path, suite_config, path)
+
+    assert plan["full_fallback"] is False
+    assert set(plan["required_suites"]) == {
+        "frontend-artifact",
+        "frontend-validation",
+        "readme-locale",
+        "webui-chat-recovery",
+        "wheel-webui-roundtrip",
+        "workflow-lint",
+    }
+    assert plan["desktop_matrix"] == []
+    assert plan["python_matrix"] == {"ubuntu": [], "windows": []}
+    assert plan["reason_codes"] == ["webui_dependency_changed"]
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "desktop/electron/package-lock.json",
+        "desktop/electron/scripts/fixtures/native-workbench-smoke/package.json",
+    ],
+)
+def test_electron_dependency_changes_select_full_desktop_matrix_only(
+    tmp_path: Path, suite_config: dict[str, Any], path: str
+) -> None:
+    plan = _plan(tmp_path, suite_config, path)
+
+    assert plan["full_fallback"] is False
+    assert set(plan["required_suites"]) == {
+        "desktop-recovery-e2e",
+        "desktop-static",
+        "frontend-artifact",
+        "readme-locale",
+        "release-packaging",
+        "workflow-lint",
+    }
+    assert plan["desktop_matrix"] == sorted(
+        suite_config["full_desktop_matrix"],
+        key=lambda cell: (cell["os"], cell["shard"]),
+    )
+    assert plan["python_matrix"] == {"ubuntu": [], "windows": []}
+    assert plan["reason_codes"] == ["electron_dependency_changed"]
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "packages/opensquilla-tui-host/pyproject.toml",
+        "src/opensquilla/cli/tui/opentui/package/bun.lock",
+    ],
+)
+def test_tui_dependency_changes_add_ubuntu_host_companion_contract(
+    tmp_path: Path, suite_config: dict[str, Any], path: str
+) -> None:
+    plan = _plan(tmp_path, suite_config, path)
+
+    assert plan["full_fallback"] is False
+    assert set(plan["required_suites"]) == {
+        "python-targeted",
+        "readme-locale",
+        "tui",
+        "workflow-lint",
+    }
+    assert plan["python_targets"] == [
+        "tests/test_packaging/test_tui_host_companion.py"
+    ]
+    assert plan["python_matrix"] == {"ubuntu": [], "windows": []}
+    assert "windows-high-risk" not in plan["required_suites"]
+    assert plan["reason_codes"] == ["tui_dependency_changed"]
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "opensquilla-webui/tools/go.sum",
+        "desktop/electron/native/pom.xml",
+        "src/opensquilla/skills/runtime/requirements.in",
+        "docs/package.json",
+        "docs/requirements.in",
+        "docs/.python-version",
+    ],
+)
+def test_unregistered_dependency_manifest_fails_closed_inside_known_domains(
+    tmp_path: Path, suite_config: dict[str, Any], path: str
+) -> None:
+    plan = _plan(tmp_path, suite_config, path)
+
+    assert plan["full_fallback"] is True
+    assert plan["reason_codes"] == ["unknown_dependency_manifest"]
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "src/opensquilla/skills/hub/installer.py",
+        "src/opensquilla/gateway/config.py",
+        "src/opensquilla/gateway/rpc/__init__.py",
+        "src/opensquilla/gateway/rpc_skills.py",
+        "src/opensquilla/gateway/scopes.py",
+        "src/opensquilla/cli/main.py",
+        "src/opensquilla/cli/skills_cmd.py",
+        "src/opensquilla/cli/skills_meta_cmd.py",
+        "src/opensquilla/tools/builtin/skill_tools.py",
+        "src/opensquilla/tools/registry.py",
+    ],
+)
+def test_skill_hub_inputs_select_all_three_contract_platforms(
+    tmp_path: Path, suite_config: dict[str, Any], path: str
+) -> None:
+    plan = _plan(tmp_path, suite_config, path)
+
+    assert plan["full_fallback"] is False
+    assert "skill-hub" in plan["required_suites"]
+    assert _platform_cells(plan, "skill-hub") == {
+        ("ubuntu-latest", "default"),
+        ("macos-latest", "default"),
+        ("windows-latest", "default"),
+    }
+    assert "skill_hub_changed" in plan["reason_codes"]
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "tests/test_skills_hub_source.py",
+        "tests/test_skills/test_hub_deps_subprocess.py",
+        "tests/test_skills/test_loader_turn_snapshot.py",
+        "tests/test_cli/test_skills_reload_cmd.py",
+    ],
+)
+def test_skill_hub_related_test_change_keeps_three_platform_suite(
+    suite_config: dict[str, Any], path: str
+) -> None:
+    plan = plan_changes(
+        [path],
+        repo=Path.cwd(),
+        config=suite_config,
+    )
+
+    assert "skill-hub" in plan["required_suites"]
+    assert _platform_cells(plan, "skill-hub") == {
+        ("ubuntu-latest", "default"),
+        ("macos-latest", "default"),
+        ("windows-latest", "default"),
+    }
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "src/opensquilla/provider/openai.py",
+        "opensquilla-webui/src/views/SettingsView.vue",
+        "docs/providers.md",
+        ".github/workflows/mirror-release-to-oss.yml",
+    ],
+)
+def test_unrelated_changes_do_not_select_skill_hub(
+    tmp_path: Path, suite_config: dict[str, Any], path: str
+) -> None:
+    plan = _plan(tmp_path, suite_config, path)
+
+    assert "skill-hub" not in plan["required_suites"]
+
+
+@pytest.mark.parametrize(
+    ("path", "target"),
+    [
+        (".github/workflows/docker-image.yml", "tests/test_ci/test_workflows.py"),
+        (
+            ".github/scripts/validate_pr_body.py",
+            "tests/test_ci/test_pr_body_lint.py",
+        ),
+        (
+            ".github/scripts/issue_link_sync.py",
+            "tests/test_github_issue_link_sync.py",
+        ),
+    ],
+)
+def test_registered_noncritical_github_inputs_get_targeted_contracts(
+    tmp_path: Path, suite_config: dict[str, Any], path: str, target: str
+) -> None:
+    plan = _plan(tmp_path, suite_config, path)
+
+    assert plan["full_fallback"] is False
+    assert "python-targeted" in plan["required_suites"]
+    assert plan["python_targets"] == [target]
+
+
+def test_release_control_script_adds_release_packaging_without_full_fallback(
+    tmp_path: Path, suite_config: dict[str, Any]
+) -> None:
+    plan = _plan(
+        tmp_path, suite_config, ".github/scripts/prestage-release-to-oss.sh"
+    )
+
+    assert plan["full_fallback"] is False
+    assert "release-packaging" in plan["required_suites"]
+    assert plan["python_targets"] == [
+        "tests/test_scripts/test_prestage_release_to_oss.py"
+    ]
+
+
+def test_unregistered_github_script_fails_closed(
+    tmp_path: Path, suite_config: dict[str, Any]
+) -> None:
+    plan = _plan(tmp_path, suite_config, ".github/scripts/new-control.py")
+
+    assert plan["full_fallback"] is True
+    assert plan["reason_codes"] == ["unregistered_ci_control_path"]
+
+
+@pytest.mark.parametrize(
+    ("path", "existing_target"),
+    [
+        (".github/workflows/wheelhouse-release.yml", "tests/test_ci/test_workflows.py"),
+        (".github/scripts/verify-release-macos-upgrade.sh", "tests/test_release_consistency.py"),
+        (
+            ".github/scripts/verify-release-macos-real-update.sh",
+            "tests/test_release_consistency.py",
+        ),
+        (".github/scripts/verify-release-windows-upgrade.ps1", "tests/test_release_consistency.py"),
+    ],
+)
+def test_upgrade_source_only_changes_select_baseline_contract(
+    tmp_path: Path,
+    suite_config: dict[str, Any],
+    path: str,
+    existing_target: str,
+) -> None:
+    plan = _plan(tmp_path, suite_config, path)
+
+    assert plan["python_targets"] == sorted(
+        [existing_target, "tests/test_ci/test_upgrade_baselines.py"]
+    )
+    assert "python-targeted" in plan["required_suites"]
+    assert plan["full_fallback"] is False
+    assert plan["desktop_matrix"] == []
+    assert plan["python_matrix"] == {"ubuntu": [], "windows": []}
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        ".github/workflows/wheelhouse-release.yml",
+        "desktop/electron/scripts/test-packaged-real-update-flow.mjs",
+        "tests/test_ci/test_upgrade_baselines.py",
+    ],
+)
+def test_upgrade_contract_inputs_change_release_packaging_digest(
+    tmp_path: Path, suite_config: dict[str, Any], path: str
+) -> None:
+    dependency = tmp_path / path
+    dependency.parent.mkdir(parents=True)
+    dependency.write_text("first\n", encoding="utf-8")
+    first = _plan(
+        tmp_path, suite_config, ".github/scripts/verify-release-macos-upgrade.sh"
+    )
+
+    dependency.write_text("second\n", encoding="utf-8")
+    second = _plan(
+        tmp_path, suite_config, ".github/scripts/verify-release-macos-upgrade.sh"
+    )
+
+    for suite in ("python-targeted", "release-packaging"):
+        assert first["suite_execution_digests"][suite] != second["suite_execution_digests"][suite]
+
+
+def test_release_packaging_executes_upgrade_baseline_contract() -> None:
+    import yaml
+
+    workflow = yaml.safe_load(Path(".github/workflows/ci.yml").read_text(encoding="utf-8"))
+    job = workflow["jobs"]["release-packaging"]
+    step = next(
+        step for step in job["steps"] if step["name"] == "Run release packaging contract tests"
+    )
+    assert "command -v node" in step["run"]
+    assert "command -v pwsh" in step["run"]
+    assert "tests/test_ci/test_upgrade_baselines.py" in step["run"].split()
+
+
+@pytest.mark.parametrize(
+    "path",
+    MERGE_CRITICAL_INPUTS,
+)
+def test_merge_critical_trust_inputs_always_force_full_fallback(
+    tmp_path: Path, suite_config: dict[str, Any], path: str
+) -> None:
+    plan = _plan(tmp_path, suite_config, path)
+
+    assert plan["full_fallback"] is True
+    assert plan["required_suites"] == sorted(suite_config["full_suites"])
+    assert plan["reason_codes"] == ["ci_policy_changed"]
+
+
+def test_noncritical_workflow_content_changes_workflow_lint_execution_digest(
+    tmp_path: Path, suite_config: dict[str, Any]
+) -> None:
+    workflow = tmp_path / ".github/workflows/example.yml"
+    workflow.parent.mkdir(parents=True)
+    workflow.write_text("name: first\n", encoding="utf-8")
+    first = plan_changes(
+        [".github/workflows/example.yml"], repo=tmp_path, config=suite_config
+    )
+
+    workflow.write_text("name: second\n", encoding="utf-8")
+    second = plan_changes(
+        [".github/workflows/example.yml"], repo=tmp_path, config=suite_config
+    )
+
+    assert first["full_fallback"] is False
+    assert second["full_fallback"] is False
+    assert (
+        first["suite_execution_digests"]["workflow-lint"]
+        != second["suite_execution_digests"]["workflow-lint"]
+    )
+
+
+def test_root_readme_content_changes_release_packaging_execution_digest(
+    tmp_path: Path, suite_config: dict[str, Any]
+) -> None:
+    readme = tmp_path / "README.md"
+    readme.write_text("first\n", encoding="utf-8")
+    first = plan_changes(["README.md"], repo=tmp_path, config=suite_config)
+
+    readme.write_text("second\n", encoding="utf-8")
+    second = plan_changes(["README.md"], repo=tmp_path, config=suite_config)
+
+    assert first["full_fallback"] is False
+    assert second["full_fallback"] is False
+    assert (
+        first["suite_execution_digests"]["release-packaging"]
+        != second["suite_execution_digests"]["release-packaging"]
+    )
+
+
+def test_removed_windows_compat_suite_has_no_contract_or_matrix_entry(
+    tmp_path: Path, suite_config: dict[str, Any]
+) -> None:
+    plan = _plan(tmp_path, suite_config, "src/opensquilla/provider/openai.py")
+
+    assert "windows-compat" not in suite_config["suites"]
+    assert "windows-compat" not in suite_config["full_suites"]
+    assert "windows-compat" not in plan["required_suites"]
+    assert not any(
+        cell["suite"] == "windows-compat" for cell in plan["platform_matrix"]
+    )
+
+
+def test_suite_contract_and_ci_result_gate_use_the_same_suite_ids(
+    suite_config: dict[str, Any],
+) -> None:
+    gate = runpy.run_path(
+        ".github/scripts/check_ci_results.py", run_name="ci_result_gate_contract"
+    )
+
+    assert set(suite_config["suites"]) == set(gate["KNOWN_SUITES"])
+    assert set(suite_config["baseline_suites"]) == set(gate["BASELINE_SUITES"])
 
 
 @pytest.mark.parametrize(
@@ -904,6 +1449,14 @@ def test_readme_locale_inputs_cover_the_executed_node_contract(
     assert "scripts/check_readme_locale_parity.py" not in inputs
 
 
+def test_release_packaging_inputs_cover_root_readmes(
+    suite_config: dict[str, Any],
+) -> None:
+    inputs = set(suite_config["suites"]["release-packaging"]["execution_inputs"])
+
+    assert "README*.md" in inputs
+
+
 def test_managed_toolchain_inputs_cover_bundled_consumers_and_tests(
     suite_config: dict[str, Any],
 ) -> None:
@@ -920,6 +1473,25 @@ def test_managed_toolchain_inputs_cover_bundled_consumers_and_tests(
         "tests/test_skills/test_paper_*.py",
         "tests/test_skills/test_subtitle_burner.py",
     } <= inputs
+
+
+def test_skill_hub_execution_digest_covers_every_routed_source_and_contract_test(
+    suite_config: dict[str, Any],
+) -> None:
+    patterns = suite_config["suites"]["skill-hub"]["execution_inputs"]
+    routed_paths = MODULE["_SKILL_HUB_SOURCE_EXACT"] | MODULE["_SKILL_HUB_TESTS"]
+    routed_paths |= {
+        "tests/test_cli/test_skills_reload_cmd.py",
+        "tests/test_gateway/test_rpc_skills_reload.py",
+        "tests/test_skills/test_hub_deps_subprocess.py",
+        "tests/test_skills/test_loader_turn_snapshot.py",
+        "tests/test_skills_hub_source.py",
+    }
+
+    assert all(
+        any(MODULE["_matches_input"](path, pattern) for pattern in patterns)
+        for path in routed_paths
+    )
 
 
 @pytest.mark.parametrize(
