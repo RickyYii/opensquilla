@@ -10,21 +10,10 @@ import {
   gatewayModelRoutingModeToUi,
   modelRoutingModeToGateway,
 } from '@/types/modelRouting'
-import type {
-  SessionMessagesSubscribeResponse,
-  SessionRoutingSnapshot,
-} from '@/types/rpc'
-
-type RpcClient = {
-  call: <T = unknown>(method: string, params?: Record<string, unknown>) => Promise<T>
-  on: (event: string, handler: (payload: unknown) => void) => () => void
-  waitForConnection?: () => Promise<void>
-}
-
-type RoutingResponse = SessionRoutingSnapshot & Record<string, unknown>
+import type { SessionRouting } from '@/modules/sessionRouting'
 
 export interface UseChatSessionRoutingOptions {
-  rpc: RpcClient
+  routing: SessionRouting
   sessionKey: Ref<string>
   globalMode: Readonly<Ref<ModelRoutingMode>>
   globalImageInputAdmission: Readonly<Ref<ImageInputAdmission>>
@@ -168,8 +157,7 @@ export function useChatSessionRouting(options: UseChatSessionRoutingOptions) {
     const requestGeneration = generation
     if (!isAvailable() || !key || options.isDraft()) return false
     try {
-      await options.rpc.waitForConnection?.()
-      const response = await options.rpc.call<RoutingResponse>('sessions.routing.get', { sessionKey: key })
+      const response = await options.routing.get(key)
       if (
         requestGeneration !== generation
         || key !== options.sessionKey.value
@@ -222,7 +210,7 @@ export function useChatSessionRouting(options: UseChatSessionRoutingOptions) {
 
       const expectedRevision = revision.value
       const deferred = options.isStreaming.value
-      const response = await options.rpc.call<RoutingResponse>('sessions.routing.set', {
+      const response = await options.routing.set({
         sessionKey: key,
         mode: modelRoutingModeToGateway(nextMode),
         expectedRevision,
@@ -254,7 +242,7 @@ export function useChatSessionRouting(options: UseChatSessionRoutingOptions) {
     }
   }
 
-  function applyBootstrap(snapshot: SessionMessagesSubscribeResponse | unknown): boolean {
+  function applyBootstrap(snapshot: unknown): boolean {
     // A draft selection is the value that will be atomically persisted with
     // its first turn. A late global/default bootstrap is not authoritative for
     // that user choice.
@@ -269,12 +257,12 @@ export function useChatSessionRouting(options: UseChatSessionRoutingOptions) {
   }
 
   function subscribe(): () => void {
-    return options.rpc.on('sessions.routing.changed', applyChangedEvent)
+    const subscription = options.routing.subscribe(applyChangedEvent)
+    return () => subscription.close()
   }
 
   watch(options.sessionKey, () => {
     reset()
-    void load()
   }, { flush: 'sync', immediate: true })
   watch(options.globalMode, nextMode => {
     // Drafts have no durable session setting yet. Their first send captures
@@ -282,7 +270,7 @@ export function useChatSessionRouting(options: UseChatSessionRoutingOptions) {
     if (options.isDraft() && !busy.value && !draftModeSelected.value) mode.value = nextMode
   })
   if (options.available) {
-    watch(options.available, available => {
+    watch(options.available, () => {
       // Capability/connection loss must cancel an in-flight mutation without
       // erasing an explicit new-chat choice or a read-only bootstrap snapshot.
       // `available` gates active get/set calls, not snapshots already delivered
@@ -291,14 +279,10 @@ export function useChatSessionRouting(options: UseChatSessionRoutingOptions) {
       mutationOwner = null
       busy.value = false
       modeAppliesNextTurn.value = false
-      if (available) void load()
     }, { flush: 'sync' })
   }
   watch(options.isStreaming, streaming => {
     if (!streaming) modeAppliesNextTurn.value = false
-  })
-  watch(() => options.isDraft(), draft => {
-    if (!draft) void load()
   })
 
   return {

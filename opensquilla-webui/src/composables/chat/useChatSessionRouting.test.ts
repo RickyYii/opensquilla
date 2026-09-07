@@ -7,6 +7,7 @@ import type {
   ModelRoutingCapabilitiesByMode,
   ModelRoutingMode,
 } from '@/types/modelRouting'
+import type { SessionRouting } from '@/modules/sessionRouting'
 
 const SESSION_ONE = 'agent:main:webchat:one'
 const SESSION_TWO = 'agent:main:webchat:two'
@@ -40,6 +41,16 @@ function harness(options: {
       return vi.fn()
     }),
   }
+  const routing = {
+    available: () => true,
+    get: (key: string, options?: { signal?: AbortSignal }) => options
+      ? rpc.call('sessions.routing.get', { sessionKey: key }, options)
+      : rpc.call('sessions.routing.get', { sessionKey: key }),
+    set: (input: { sessionKey: string; mode: string; expectedRevision: number }, options?: { signal?: AbortSignal }) => options
+      ? rpc.call('sessions.routing.set', input, options)
+      : rpc.call('sessions.routing.set', input),
+    subscribe: (handler: (payload: unknown) => void) => ({ close: rpc.on('sessions.routing.changed', handler) }),
+  } as unknown as SessionRouting
   const sessionKey = ref(SESSION_ONE)
   const globalMode = ref<ModelRoutingMode>(options.globalMode ?? 'off')
   const globalImageInputAdmission = ref<ImageInputAdmission>(
@@ -56,7 +67,7 @@ function harness(options: {
   const available = ref(options.available !== false)
   const notifyError = vi.fn()
   const api = useChatSessionRouting({
-    rpc,
+    routing,
     sessionKey,
     globalMode,
     globalImageInputAdmission,
@@ -228,7 +239,6 @@ describe('useChatSessionRouting', () => {
   it('keeps a repeated durable selection out of the busy mutation path', async () => {
     const { api, rpc } = harness()
     api.applyBootstrap({ key: SESSION_ONE, mode: 'router', revision: 2 })
-    await vi.waitFor(() => expect(rpc.call).toHaveBeenCalled())
     rpc.call.mockClear()
 
     await expect(api.setMode('squilla_router')).resolves.toBe(true)
@@ -252,7 +262,13 @@ describe('useChatSessionRouting', () => {
       on: vi.fn(() => vi.fn()),
     }
     const api = useChatSessionRouting({
-      rpc,
+      routing: {
+        available: () => true,
+        get: key => rpc.call('sessions.routing.get', { sessionKey: key }),
+        set: input => rpc.call('sessions.routing.set', input as unknown as Record<string, unknown>),
+        subscribe: _handler => ({ close: rpc.on() }),
+        dispose: () => undefined,
+      },
       sessionKey: ref(SESSION_ONE),
       globalMode: ref<ModelRoutingMode>('off'),
       globalImageInputAdmission: ref<ImageInputAdmission>('unknown'),
@@ -264,10 +280,10 @@ describe('useChatSessionRouting', () => {
     })
 
     const selected = api.setMode('off')
-    await vi.waitFor(() => expect(pendingGets.length).toBeGreaterThanOrEqual(2))
+    await vi.waitFor(() => expect(pendingGets).toHaveLength(1))
     expect(api.busy.value).toBe(true)
     await expect(api.setMode('llm_ensemble')).resolves.toBe(false)
-    expect(pendingGets).toHaveLength(2)
+    expect(pendingGets).toHaveLength(1)
     pendingGets.forEach(resolve => resolve({ key: SESSION_ONE, mode: 'ensemble', revision: 0 }))
 
     await expect(selected).resolves.toBe(true)

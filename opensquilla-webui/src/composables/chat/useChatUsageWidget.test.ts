@@ -1,63 +1,76 @@
 import { ref } from 'vue'
 import { describe, expect, it, vi } from 'vitest'
-
 import { useChatUsageWidget } from './useChatUsageWidget'
-import type { RpcCallOptions } from '@/lib/rpc'
+import type {
+  UsageContextStatus,
+  UsageReporting,
+  UsageReportingRequestOptions,
+} from '@/modules/usageReporting'
+import { usageReportingDouble, usageSession, usageStatus } from '@/testing/usage.test-helper'
 
 describe('useChatUsageWidget background reads', () => {
-  it('uses the injected bounded options without changing its public loader', async () => {
-    const readCallOptions: RpcCallOptions = {
-      timeoutMs: 2_000,
-      timeoutAction: 'reconnect',
-      abortAction: 'reconnect',
+  it('uses injected bounded options and the canonical domain result', async () => {
+    const readOptions: UsageReportingRequestOptions = {
+      timeoutMs: 2_000, signal: new AbortController().signal,
     }
-    const rpc = {
-      waitForConnection: vi.fn().mockResolvedValue(undefined),
-      call: vi.fn().mockResolvedValue({
-        sessions: [{
-          sessionKey: 'agent:main:webchat:usage',
-          inputTokens: 12,
-          outputTokens: 8,
-        }],
-      }),
-    }
+    const status = vi.fn<UsageReporting['status']>().mockResolvedValue(usageStatus({
+      sessions: [{
+        ...usageSession({
+          sessionKey: 'agent:main:webchat:usage', inputTokens: 12, outputTokens: 8,
+        }),
+        contextStatus: null,
+      }],
+    }))
     const api = useChatUsageWidget({
-      rpc,
-      readCallOptions,
+      usageReporting: usageReportingDouble({ status }),
+      readOptions,
       sessionKey: ref('agent:main:webchat:usage'),
       tokenVizEnabled: () => false,
     })
 
     await api.loadCurrentSessionUsage()
 
-    expect(rpc.waitForConnection).toHaveBeenCalledWith(
-      2_000,
-      undefined,
-      {
-        timeoutAction: 'reconnect',
-        abortAction: 'reconnect',
-      },
-    )
-    expect(rpc.call).toHaveBeenCalledWith(
-      'usage.status',
-      { sessionKey: 'agent:main:webchat:usage' },
-      readCallOptions,
-    )
-    expect(api.usageAccum.value).toMatchObject({ input: 12, output: 8 })
+    expect(status).toHaveBeenCalledExactlyOnceWith('agent:main:webchat:usage', readOptions)
+    expect(api.usageAccum.value).toMatchObject({
+      input: 12, output: 8, cacheRead: 0, cacheWrite: 0, cost: null,
+    })
+  })
+
+  it('clears previous usage and context warnings when the new session has no measurements', async () => {
+    const status = vi.fn<UsageReporting['status']>()
+      .mockResolvedValueOnce(usageStatus({
+        sessions: [{
+          ...usageSession({ sessionKey: 'session', inputTokens: 900, costUsd: 0.5 }),
+          contextStatus: {
+            contextTokens: 900, contextWindowTokens: 1000, pressure: 0.9, warningRatio: 0.85,
+          },
+        }],
+      }))
+      .mockResolvedValueOnce(usageStatus({
+        sessions: [{ ...usageSession({ sessionKey: 'session' }), contextStatus: null }],
+      }))
+    const api = useChatUsageWidget({
+      usageReporting: usageReportingDouble({ status }),
+      sessionKey: ref('session'), tokenVizEnabled: () => false,
+    })
+    await api.loadCurrentSessionUsage()
+    expect(api.usageAccum.value.cost).toBe(0.5)
+    expect(api.contextWarning.value?.pct).toBe(90)
+    await api.loadCurrentSessionUsage()
+    expect(api.usageAccum.value).toMatchObject({ input: 0, output: 0, cost: null })
+    expect(api.contextWarning.value).toBeNull()
   })
 })
 
 describe('useChatUsageWidget context usage', () => {
   const SESSION = 'agent:main:webchat:context'
 
-  async function loadWithContextStatus(contextStatus: Record<string, unknown> | null) {
+  async function loadWithContextStatus(contextStatus: UsageContextStatus | null) {
+    const status = vi.fn<UsageReporting['status']>().mockResolvedValue(usageStatus({
+      sessions: [{ ...usageSession({ sessionKey: SESSION }), contextStatus }],
+    }))
     const api = useChatUsageWidget({
-      rpc: {
-        waitForConnection: vi.fn().mockResolvedValue(undefined),
-        call: vi.fn().mockResolvedValue({
-          sessions: [{ sessionKey: SESSION, contextStatus }],
-        }),
-      },
+      usageReporting: usageReportingDouble({ status }),
       sessionKey: ref(SESSION),
       tokenVizEnabled: () => false,
     })
@@ -110,32 +123,17 @@ describe('useChatUsageWidget context usage', () => {
     // No denominator, no percentage: an invented one would read as measured.
     expect((await loadWithContextStatus(null)).contextUsage.value).toBeNull()
     expect(
-      (await loadWithContextStatus({ contextTokens: 54_000 })).contextUsage.value,
-    ).toBeNull()
-    expect(
       (await loadWithContextStatus({
         contextTokens: 54_000,
         contextWindowTokens: 0,
+        pressure: 0,
+        warningRatio: 0.85,
       })).contextUsage.value,
     ).toBeNull()
   })
 
-  it('derives pressure from the counts when an older gateway omits it', async () => {
-    const api = await loadWithContextStatus({
-      context_tokens: 32_000,
-      context_window_tokens: 128_000,
-    })
-
-    expect(api.contextUsage.value).toEqual({
-      pct: 25,
-      usedK: 32,
-      windowK: 128,
-      warning: false,
-    })
-  })
-
   it('keeps a fresh session at 0% instead of dropping the reading', async () => {
-    // ``pressure: 0`` is a real measurement, not a missing one.
+    // `pressure: 0` is a real measurement, not a missing one.
     const api = await loadWithContextStatus({
       contextTokens: 0,
       contextWindowTokens: 128_000,
@@ -149,5 +147,20 @@ describe('useChatUsageWidget context usage', () => {
       windowK: 128,
       warning: false,
     })
+  })
+
+  it('keeps contextWarning as the above-threshold half of the same reading', async () => {
+    // Main's existing consumers ask for the warning; they must not start
+    // seeing a chip at 42% because the reading became always-on.
+    const below = await loadWithContextStatus({
+      contextTokens: 54_000, contextWindowTokens: 128_000, pressure: 0.42, warningRatio: 0.85,
+    })
+    expect(below.contextUsage.value).not.toBeNull()
+    expect(below.contextWarning.value).toBeNull()
+
+    const above = await loadWithContextStatus({
+      contextTokens: 116_000, contextWindowTokens: 128_000, pressure: 0.9, warningRatio: 0.85,
+    })
+    expect(above.contextWarning.value).toEqual(above.contextUsage.value)
   })
 })

@@ -559,7 +559,7 @@
       "builtin": "組み込み",
       "actions": { "add": "追加", "remove": "削除", "retry": "再試行", "copy": "コピー", "saving": "保存中…", "redetect": "再検出" },
       "mode": {
-        "title": "既定のアクセスモード", "description": "新しいタスクの開始モードを選びます。能力検証に失敗した場合、Safe は選択できません。",
+        "title": "既定のアクセスモード", "description": "全体のアクセスモードを設定します。初めて Safe を選ぶとサンドボックスの設定が開きます。初期化に失敗した場合や未対応の場合は選択できません。",
         "default": "既定モード", "safe": "Safe", "full": "完全アクセス", "resetWarning": "起動時の警告を再表示"
       },
       "setup": {
@@ -1638,9 +1638,6 @@
       "descReloadSuffix": "ページ更新後に有効になります。",
       "experimentsGroup": "実験機能",
       "managementGroup": "管理",
-      "foldLabel": "新しいライブターン描画",
-      "foldDesc": "順序付きイベントログからストリーミング中の作業カードを描画します。互換描画へ一時的に戻す場合のみオフにします。",
-      "foldAria": "新しいライブターン描画（再読み込み後に有効）",
       "revealLabel": "回答の表示ウィンドウ（ミリ秒）",
       "revealDesc": "ルーターが先に判断できるよう、ライブ回答の表示を [最小, 最大] のウィンドウ内で保持します。最小 ≤ 最大。",
       "revealMinAria": "回答表示の最小ミリ秒",
@@ -1679,6 +1676,7 @@
       "providerProfileRemoved": "{provider} を削除しました。",
       "providerProfileRemovedImageEnv": "モデルサービスから {provider} を削除しました。画像生成は {envKey} により引き続き利用できます。",
       "providerProfileRemovedImageNeedsCredential": "{provider} を削除しました。画像生成のプロバイダーとモデルは保持されていますが、認証情報の設定が必要です。",
+      "providerRemovedRouterDisabled": "{provider} を削除しました。保存済みの階層が別のプロバイダーを使用しているため、モデルルーティングをオフにしました。",
       "providerCredentialRemoved": "{provider} の認証情報を削除しました。",
       "providerCredentialExternalStillActive": "OpenSquilla に保存された {provider} の認証情報参照を削除しましたが、システム環境変数 {envKey} から引き続き認証情報が提供されています。",
       "providerActivated": "{provider} をアクティブにしました。",
@@ -3409,8 +3407,11 @@
     "retryingSessionDescription": "会話履歴を復元しています…",
     "retryingSessionAction": "再読み込み中…",
     "liveConnecting": "リアルタイム更新を復元しています…",
+    "liveConnectingConnected": "Gateway に接続済みです。このセッションのリアルタイム更新を復元しています…",
+    "gatewayReconnecting": "Gateway に再接続しています…",
     "liveUnavailable": "リアルタイム更新を一時的に利用できません",
     "liveUnavailableDescription": "履歴は引き続き表示できます。送信前に再接続してください。",
+    "liveUnavailableConnectedDescription": "Gateway には接続済みで、履歴も表示できます。リアルタイム更新の復元後に送信を再開できます。",
     "reconnectLive": "再接続",
     "liveSendBlockedConnecting": "リアルタイム更新を復旧しています。下書きは保持されています。",
     "liveSendBlockedDegraded": "送信前にリアルタイム更新を再接続してください。下書きは保持されています。",
