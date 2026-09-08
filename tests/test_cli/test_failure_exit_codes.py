@@ -14,6 +14,7 @@ These tests pin that the three reach the same codes.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
@@ -37,25 +38,47 @@ def _no_ambient_gateway(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None
     monkeypatch.setenv("OPENSQUILLA_STATE_DIR", str(empty))
 
 
-def _install_client(monkeypatch: pytest.MonkeyPatch, failure: BaseException | None) -> None:
-    """A gateway client whose connect raises `failure`, or succeeds with no data."""
+def _install_client(
+    monkeypatch: pytest.MonkeyPatch,
+    failure: BaseException | None,
+    *,
+    raised_by: str = "call",
+    delete_result: dict[str, Any] | None = None,
+    history: dict[str, Any] | None = None,
+) -> None:
+    """A gateway client that fails where the real one fails.
+
+    `GatewayClient.connect` wraps every failure in `SystemExit`, so that is
+    the only thing it can raise. A `GatewayRPCError` or a dropped connection
+    surfaces later, out of the RPC call itself, so those are raised from the
+    methods — a fake that raises them from `connect` would exercise a path
+    production cannot reach.
+    """
+
+    def _fail() -> None:
+        if failure is not None and raised_by == "call":
+            raise failure
 
     class FakeClient:
         async def connect(self, url: str, *, token: str | None = None) -> None:
-            if failure is not None:
+            if failure is not None and raised_by == "connect":
                 raise failure
 
         async def resolve_session(self, session_id: str) -> dict[str, Any]:
-            return {"key": SESSION, "status": "idle"}
+            _fail()
+            return {"key": SESSION, "status": "idle", "model": "m", "updated_at": "u"}
 
         async def preview_sessions(self, keys: list[str]) -> dict[str, Any]:
-            return {"previews": []}
+            _fail()
+            return {"previews": [{"lastMessage": "the last thing said"}]}
 
         async def session_history(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
-            return {"messages": []}
+            _fail()
+            return history if history is not None else {"messages": []}
 
         async def delete_sessions(self, keys: list[str]) -> dict[str, Any]:
-            return {"deleted": keys}
+            _fail()
+            return delete_result if delete_result is not None else {"deleted": keys}
 
         async def close(self) -> None:
             return None
@@ -94,15 +117,23 @@ def test_a_dropped_connection_reports_rather_than_traces(
     assert result.exit_code == 1, result.stdout
     assert result.exception is None or isinstance(result.exception, SystemExit)
     assert result.stderr.strip(), "the failure has to be reported somewhere"
+    assert result.stdout.strip() == ""
+    # The sentinel exists to keep this apart from an unreachable gateway: the
+    # gateway answered and then went away, so the hint would misdiagnose it.
+    assert "requires a running gateway" not in result.stderr
 
 
 @pytest.mark.parametrize("name", sorted(COMMANDS))
 def test_an_unreachable_gateway_exits_one(name: str, monkeypatch: pytest.MonkeyPatch) -> None:
-    _install_client(monkeypatch, SystemExit("gateway is not running"))
+    _install_client(monkeypatch, SystemExit("gateway is not running"), raised_by="connect")
 
     result = runner.invoke(app, COMMANDS[name])
 
     assert result.exit_code == 1, result.stdout
+    # Both the shared diagnostic and the command-specific hint, on stderr.
+    assert "gateway is not running" in result.stderr
+    assert "requires a running gateway" in result.stderr
+    assert result.stdout.strip() == ""
 
 
 @pytest.mark.parametrize("name", sorted(COMMANDS))
@@ -190,3 +221,133 @@ def test_a_bad_format_is_reported_on_stderr(tmp_path: Path) -> None:
     assert result.exit_code == 2
     assert "--format" in result.stderr
     assert result.stdout.strip() == ""
+
+
+def test_a_delete_that_deleted_nothing_does_not_exit_zero(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`sessions.delete` reports per-key failures inside a *successful* reply.
+
+    `SessionLifecycle.delete` collects them into `DeleteSessionsResult.
+    failures` and the adapter serialises them as `errors`, so the RPC never
+    raises and the command used to exit 0. A script running
+    `sessions delete KEY && ...` then believed the session was gone.
+    """
+
+    _install_client(
+        monkeypatch,
+        None,
+        delete_result={"deleted": [], "errors": [f"{SESSION}: storage refused"]},
+    )
+
+    result = runner.invoke(app, COMMANDS["delete"])
+
+    assert result.exit_code == 1, result.stdout
+    assert "storage refused" in result.stderr
+    # The envelope still goes to stdout, so a caller can see what did go.
+    assert json.loads(result.stdout) == {
+        "deleted": [],
+        "errors": [f"{SESSION}: storage refused"],
+    }
+
+
+def test_a_partly_failed_delete_is_still_a_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    """One key gone and one refused is not success for the caller."""
+
+    _install_client(
+        monkeypatch,
+        None,
+        delete_result={"deleted": ["other"], "errors": [f"{SESSION}: locked"]},
+    )
+
+    result = runner.invoke(app, COMMANDS["delete"])
+
+    assert result.exit_code == 1
+    assert json.loads(result.stdout)["deleted"] == ["other"]
+
+
+def test_a_clean_delete_still_exits_zero(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An empty `errors` list must not be read as a failure."""
+
+    _install_client(monkeypatch, None, delete_result={"deleted": [SESSION], "errors": []})
+
+    result = runner.invoke(app, COMMANDS["delete"])
+
+    assert result.exit_code == 0, result.stderr
+    assert json.loads(result.stdout)["deleted"] == [SESSION]
+
+
+@pytest.mark.parametrize("session_id", ["[/dim]", "[bold]loud"])
+def test_a_session_id_is_not_read_as_markup(
+    session_id: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The hint interpolates operator input into a rich markup string.
+
+    Unescaped, `[/dim]` raised MarkupError before the exit could run — a
+    traceback on the very path that exists to replace one — and `[bold]x`
+    printed a mangled id naming the wrong session.
+    """
+
+    _install_client(monkeypatch, SystemExit("gateway is not running"), raised_by="connect")
+
+    result = runner.invoke(app, ["sessions", "resume", session_id])
+
+    assert result.exit_code == 1
+    assert result.exception is None or isinstance(result.exception, SystemExit)
+    assert session_id in result.stderr
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [OSError(), TimeoutError(), ConnectionResetError()],
+    ids=["os-error", "timeout", "reset"],
+)
+def test_a_failure_with_no_message_still_names_itself(
+    failure: BaseException, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`str(OSError())` is empty, so the diagnostic was a bare "Error:".
+
+    `TimeoutError` is an `OSError` subclass since 3.11, so an RPC timeout
+    lands here too.
+    """
+
+    _install_client(monkeypatch, failure)
+
+    result = runner.invoke(app, COMMANDS["export"])
+
+    assert result.exit_code == 1
+    assert type(failure).__name__ in result.stderr
+
+
+def test_a_successful_export_writes_the_transcript_it_fetched(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """`target.exists()` alone passes on a zero-byte file."""
+
+    _install_client(
+        monkeypatch,
+        None,
+        history={"messages": [{"role": "user", "content": "hello there"}]},
+    )
+
+    target = tmp_path / "out.md"
+    result = runner.invoke(app, ["sessions", "export", SESSION, "--output", str(target)])
+
+    assert result.exit_code == 0, result.stderr
+    body = target.read_text(encoding="utf-8")
+    assert SESSION in body
+    assert "hello there" in body
+
+
+def test_an_export_with_no_messages_falls_back_to_the_preview(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The documented fallback, which no test covered."""
+
+    _install_client(monkeypatch, None)
+
+    target = tmp_path / "out.md"
+    result = runner.invoke(app, ["sessions", "export", SESSION, "--output", str(target)])
+
+    assert result.exit_code == 0, result.stderr
+    assert "the last thing said" in target.read_text(encoding="utf-8")

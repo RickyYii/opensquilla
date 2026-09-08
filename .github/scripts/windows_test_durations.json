@@ -227,6 +227,7 @@
     "tests/test_cli/test_diagnostics_cmd.py": 0.448,
     "tests/test_cli/test_doctor_cmd.py": 3.381,
     "tests/test_cli/test_ensemble_bench.py": 1.226,
+    "tests/test_cli/test_failure_exit_codes.py": 0.01,
     "tests/test_cli/test_gateway_bind_preflight.py": 0.01,
     "tests/test_cli/test_gateway_client_keepalive.py": 0.144,
     "tests/test_cli/test_gateway_client_malformed_frames.py": 0.02,
@@ -1528,7 +1529,6 @@
     "tests/unit/cli/tui/test_tui_replay_harness.py": 0.055,
     "tests/unit/test_env.py": 0.042,
     "tests/unit/test_env_loading.py": 0.061,
-    "tests/unit/test_ui.py": 0.033,
-    "tests/test_cli/test_failure_exit_codes.py": 0.01
+    "tests/unit/test_ui.py": 0.033
   }
 }

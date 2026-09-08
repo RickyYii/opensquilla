@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -19,7 +20,7 @@ from opensquilla.cli.gateway_rpc import (
     run_gateway_sync,
 )
 from opensquilla.cli.output import emit_error, print_json
-from opensquilla.cli.ui import ACCENT, ACCENT_HEADER, console, error_console
+from opensquilla.cli.ui import ACCENT, ACCENT_HEADER, console, error_console, markup_escape
 
 app = typer.Typer(help="Manage chat sessions.")
 
@@ -34,7 +35,10 @@ class _ActionFailed:
     gateway's error code through `rpc_error_exit_code` and raises `typer.Exit`.
     The commands below handle their own connection so they can print a
     command-specific hint, and used to drop the code on the floor along with the
-    failure itself. Keeping it here lets them exit the way their siblings do.
+    failure itself. Keeping it here lets them exit with the same codes. They
+    still differ from the shared path in other ways — notably it sends an auth
+    token and this one does not — which is a separate defect, not one this
+    sentinel addresses.
     """
 
     __slots__ = ("code",)
@@ -122,7 +126,9 @@ def _filter_sessions(
     return filtered
 
 
-async def _with_client(action):
+async def _with_client(
+    action: Callable[[Any], Awaitable[Any]],
+) -> Any:
     from opensquilla.cli.gateway_client import GatewayClient, GatewayRPCError
 
     client = GatewayClient()
@@ -151,8 +157,10 @@ async def _with_client(action):
         # sibling commands print one line. It gets its own sentinel: the
         # gateway answered and then went away, which is not the same as never
         # having been there, and the callers' "requires a running gateway"
-        # hint would be a wrong diagnosis.
-        emit_error(str(exc), code="GATEWAY_UNAVAILABLE")
+        # hint would be a wrong diagnosis. `OSError()` and `TimeoutError()`
+        # (an OSError since 3.11) carry no message at all, so name the class
+        # rather than printing a bare "Error:".
+        emit_error(str(exc) or type(exc).__name__, code="GATEWAY_UNAVAILABLE")
         return _CONNECTION_LOST
     finally:
         await client.close()
@@ -257,7 +265,12 @@ def sessions_resume(session_id: str = typer.Argument(..., help="Session ID to re
 
     result = asyncio.run(_with_client(_run))
     if result is _CLIENT_UNAVAILABLE:
-        error_console.print(f"[dim]Session {session_id!r} requires a running gateway.[/dim]")
+        # `markup_escape`, because a session id is operator input and rich
+        # reads `[/dim]` in it as markup: unescaped, `sessions resume '[/dim]'`
+        # raised MarkupError before this line could exit, and `[bold]x` printed
+        # a mangled id that named the wrong session.
+        hint = markup_escape(repr(session_id))
+        error_console.print(f"[dim]Session {hint} requires a running gateway.[/dim]")
         raise typer.Exit(1)
     if result is _CONNECTION_LOST:
         raise typer.Exit(1)
@@ -315,6 +328,18 @@ def sessions_delete(
     if isinstance(result, _ActionFailed):
         raise typer.Exit(rpc_error_exit_code(result.code))
     console.print_json(data=result)
+    # `sessions.delete` reports per-key failures inside a *successful* reply:
+    # `SessionLifecycle.delete` collects them into `DeleteSessionsResult.
+    # failures`, and the adapter serialises them as `errors`. So a delete that
+    # deleted nothing still came back through the happy path and exited 0 —
+    # the case this command is here to stop, since a script chaining on it
+    # believes the session is gone. The envelope stays on stdout so a caller
+    # can still see which keys did go.
+    errors = result.get("errors") or [] if isinstance(result, dict) else []
+    if errors:
+        for failure in errors:
+            emit_error(str(failure), code="DELETE_FAILED")
+        raise typer.Exit(1)
 
 
 @app.command("export")
@@ -339,7 +364,7 @@ def sessions_export(
         history = await session_history_all(client.session_history, key)
         return {"resolved": resolved, "preview": preview, "history": history}
 
-    result: dict[str, Any] | None = asyncio.run(_with_client(_run))
+    result = asyncio.run(_with_client(_run))
     if result is _CLIENT_UNAVAILABLE:
         error_console.print("[dim]Session export requires a running gateway.[/dim]")
         raise typer.Exit(1)
@@ -347,9 +372,6 @@ def sessions_export(
         raise typer.Exit(1)
     if isinstance(result, _ActionFailed):
         raise typer.Exit(rpc_error_exit_code(result.code))
-    if result is None:
-        emit_error("Session export returned no data.")
-        raise typer.Exit(1)
     target = output or Path(f"{session_id.replace(':', '-')}.{format}")
     if format == "json":
         body = json.dumps(result, ensure_ascii=False, indent=2)
