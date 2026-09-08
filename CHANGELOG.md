@@ -6,6 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- `context_budget_tokens` now requires a positive value. A non-positive one
+  meant five different things depending on which reader saw it — every turn
+  over budget, no application cap at all, a hard error, a one-token window, or
+  a silent rewrite to the default — and a negative one reached the compactor
+  unchanged. An existing config carrying one is clamped to the default on load
+  rather than failing to start.
+
 ### Added
 
 - Browser extensions can now reach state-changing HTTP and WebSocket endpoints

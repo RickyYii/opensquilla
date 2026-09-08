@@ -2706,13 +2706,28 @@ class GatewayConfig(BaseSettings):
     # Budget and policy consulted in gateway/rpc_chat.py before dispatching
     # a turn. ``context_budget_tokens`` is a soft cap: when an estimated
     # turn payload exceeds this, the policy branch fires.
-    # Validated here because its readers disagree about what a non-positive
-    # value means: the overflow policy puts every turn over budget,
-    # ``compaction_target`` reads it as "no application cap", the session
-    # maintenance port raises, and the engine falls back to 100_000. A
-    # deployment that sets one cannot be given a single answer, so refuse it
-    # at load instead of picking one of the four at random.
-    context_budget_tokens: int = Field(default=100_000, gt=0)
+    # Bounded because five readers make five different things of a
+    # non-positive value:
+    #
+    #   context_overflow.apply_context_overflow_policy compares against it
+    #     literally, so a two-character message clears a budget of 0 and every
+    #     turn enters the policy branch;
+    #   compaction_target skips its ``min()`` unless the value is > 0, so the
+    #     same setting means "no application cap";
+    #   adapters/session_maintenance raises "contextWindowTokens must be a
+    #     positive integer";
+    #   cli/tui/adapters/slash_standalone collapses it to a one-token window
+    #     via ``max(1, int(cap or 1))``;
+    #   engine/runtime's ``or`` chain rewrites 0 to 100_000 but passes a
+    #     negative straight through to ``compact()``.
+    #
+    # Two of those already treat it as an error, and only one implements the
+    # "0 means no cap" idiom that llm.max_tokens and llm.context_window_tokens
+    # use. Honouring 0 everywhere would mean changing three readers and would
+    # still leave negatives meaningless, so this takes the other option and
+    # refuses the value. ``config_migration`` clamps a legacy one so an
+    # existing config still loads.
+    context_budget_tokens: int = Field(default=100_000, ge=1)
     context_overflow_policy: ContextOverflowPolicy = ContextOverflowPolicy.AUTO_SUMMARIZE
     preflight_compact_ratio: float = Field(default=0.85, gt=0.0, le=1.0)
 

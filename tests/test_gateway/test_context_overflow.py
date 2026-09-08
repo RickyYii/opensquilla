@@ -9,10 +9,15 @@ from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
+from pydantic import ValidationError
 
 from opensquilla.gateway import context_overflow
 from opensquilla.gateway.compaction_target import resolve_gateway_compaction_target
 from opensquilla.gateway.config import ContextOverflowPolicy, GatewayConfig
+from opensquilla.gateway.config_migration import (
+    _DEFAULT_CONTEXT_BUDGET_TOKENS,
+    migrate_config_payload,
+)
 from opensquilla.gateway.context_overflow import (
     OverflowOutcome,
     apply_context_overflow_policy,
@@ -315,63 +320,71 @@ def test_gateway_memory_flush_triggers_reject_unknown_values(
 
 @pytest.mark.parametrize("budget", [0, -1, -100_000])
 def test_context_budget_tokens_rejects_a_non_positive_budget(budget: int) -> None:
-    """Four readers, four different meanings for the same non-positive value.
+    """Five readers, five different meanings for the same non-positive value.
 
     `apply_context_overflow_policy` compares against it literally, so every
     turn goes over budget; `compaction_target` reads it as "no application
-    cap" and skips the `min()`; the session maintenance port raises
-    "contextWindowTokens must be a positive integer"; and `engine/runtime`
-    falls through its `or` chain to 100_000. A deployment that sets one
-    cannot be given a single answer, so refuse it at load.
+    cap" and skips the `min()`; the session maintenance port raises;
+    `slash_standalone` collapses it to a one-token window; and
+    `engine/runtime` rewrites 0 to 100_000 while passing a negative straight
+    through to `compact()`.
     """
 
-    with pytest.raises(ValueError, match="greater than 0"):
+    with pytest.raises(ValidationError):
         GatewayConfig(context_budget_tokens=budget)
 
 
 def test_context_budget_tokens_still_takes_any_positive_budget() -> None:
-    """The constraint must not narrow a deployment's real choices."""
+    """The bound must not narrow a deployment's real choices.
+
+    One token is a legitimate, if extreme, setting; the bound is only there to
+    exclude the values nothing can agree on.
+    """
 
     assert GatewayConfig(context_budget_tokens=1).context_budget_tokens == 1
     assert GatewayConfig(context_budget_tokens=8_000).context_budget_tokens == 8_000
     assert GatewayConfig().context_budget_tokens == 100_000
 
 
-@pytest.mark.asyncio
-async def test_a_zero_budget_put_every_turn_over_the_limit() -> None:
-    """What the rejected value did on the path that read it literally.
+@pytest.mark.parametrize("budget", [0, -1, -100_000])
+def test_a_legacy_non_positive_budget_is_clamped_rather_than_fatal(budget: int) -> None:
+    """A new bound must not stop an existing config from loading.
 
-    `budget_override` carries the same number `context_budget_tokens` used to
-    supply, and it has no production callers, so this is the behaviour the
-    constraint removes: a two-character message clears a zero budget, and
-    under REFUSE the deployment answered nothing at all.
+    `config_migration` documents range clamps as an always-run transform for
+    exactly this — `_clamp_search_max_results` is the precedent — so a config
+    written before the bound repairs to the default instead of failing strict
+    validation at the GatewayConfig boundary.
     """
 
-    cfg = GatewayConfig(context_overflow_policy=ContextOverflowPolicy.REFUSE)
-
-    zero = await apply_context_overflow_policy(
-        config=cfg,
-        message="hi",
-        transcript=[],
-        session_key="s-zero-budget",
-        session_manager=None,
-        budget_override=0,
+    result = migrate_config_payload(
+        {"port": 18791, "context_budget_tokens": budget},
+        emit_diagnostics=False,
     )
 
-    assert zero.estimated_tokens > 0
-    assert zero.over_budget is True
-    assert zero.refusal is not None
+    assert result.changed is True
+    assert any("context_budget_tokens" in change for change in result.changes)
+    assert GatewayConfig(**result.payload).context_budget_tokens == 100_000
 
-    default = await apply_context_overflow_policy(
-        config=cfg,
-        message="hi",
-        transcript=[],
-        session_key="s-default-budget",
-        session_manager=None,
+
+def test_a_positive_budget_survives_the_migration_untouched() -> None:
+    """The clamp must not rewrite a value the deployment chose."""
+
+    result = migrate_config_payload(
+        {"port": 18791, "context_budget_tokens": 8_000},
+        emit_diagnostics=False,
     )
 
-    assert default.over_budget is False
-    assert default.refusal is None
+    assert result.payload["context_budget_tokens"] == 8_000
+    assert GatewayConfig(**result.payload).context_budget_tokens == 8_000
+
+
+def test_the_clamps_repair_value_is_the_field_default() -> None:
+    """`config.py` imports the migration module, so the default is duplicated.
+
+    Pinning them together is what stops the copy drifting.
+    """
+
+    assert _DEFAULT_CONTEXT_BUDGET_TOKENS == GatewayConfig().context_budget_tokens
 
 
 def _history(n_entries: int, chars_per_entry: int) -> list[_FakeEntry]:

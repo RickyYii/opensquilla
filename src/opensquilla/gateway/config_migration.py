@@ -90,6 +90,12 @@ DEPRECATED_AGENT_TOKEN_SAVING_LEAVES: frozenset[str] = frozenset(
     k.removeprefix("agent_token_saving.")
     for k in DEPRECATED_AGENT_TOKEN_SAVING_FIELDS
 )
+# Repair value for a legacy non-positive ``context_budget_tokens``. Kept here
+# rather than imported because ``gateway/config.py`` imports this module;
+# ``test_context_overflow`` pins it to the field default so the two cannot
+# drift apart.
+_DEFAULT_CONTEXT_BUDGET_TOKENS = 100_000
+
 _LEGACY_LLM_ENSEMBLE_TIMEOUT_SECONDS = frozenset({120.0, 300.0})
 _DEFAULT_LLM_ENSEMBLE_TIMEOUT_SECONDS = 3600.0
 
@@ -325,6 +331,7 @@ def migrate_config_payload(
         emit_diagnostics=emit_diagnostics,
     )
     _clamp_search_max_results(builder)
+    _clamp_context_budget_tokens(builder)
     _park_unknown_channel_entries(builder, emit_diagnostics=emit_diagnostics)
     _disable_unverifiable_feishu_webhook_entries(builder)
     _clear_mismatched_router_tier_profile(builder)
@@ -488,6 +495,31 @@ def _clamp_search_max_results(builder: _MigrationBuilder) -> None:
             f"search_max_results: {search_max_results} -> {coerced} "
             f"(clamped to [1, {MAX_SEARCH_RESULTS}])"
         )
+
+
+def _clamp_context_budget_tokens(builder: _MigrationBuilder) -> None:
+    """Always-run: coerce a non-positive ``context_budget_tokens`` to the default.
+
+    context_budget_tokens gained a lower bound (>= 1); coerce any legacy
+    out-of-range value here so an older config loads instead of failing strict
+    validation at the GatewayConfig boundary. The default is the repair rather
+    than 1 because a one-token budget puts every turn over the limit, which is
+    one of the behaviours the bound exists to remove.
+    """
+    budget = builder.payload.get("context_budget_tokens")
+    if budget is None or isinstance(budget, bool):
+        return
+    try:
+        requested = int(budget)
+    except (TypeError, ValueError):
+        return
+    if requested >= 1:
+        return
+    coerced = _DEFAULT_CONTEXT_BUDGET_TOKENS
+    builder.payload["context_budget_tokens"] = coerced
+    builder.changes.append(
+        f"context_budget_tokens: {budget} -> {coerced} (must be >= 1)"
+    )
 
 
 def _park_unknown_channel_entries(
