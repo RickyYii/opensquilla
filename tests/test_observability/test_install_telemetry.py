@@ -24,12 +24,23 @@ PRODUCTION_ENDPOINT = "https://telemetry.opensquilla.ai/v1/install"
 # describes the defect.
 #
 # The previous one- and ten-second bounds were tight enough to lose that
-# property on a loaded Windows runner: starting a daemon thread, creating two
-# interpreters, and importing this package in each of them are all far slower
-# there than on Linux, so the deadline could expire while the code under test
-# was working. That reports a stall the product does not have, on a shard whose
-# other 7000 tests are unrelated.
+# property on a loaded Windows runner, where starting a daemon thread, creating
+# two interpreters and importing this package in each of them are all far
+# slower than on Linux. Which of them expired first is not recorded here; the
+# point of the change is that none of these bounds should be close enough to a
+# healthy run's cost to decide the outcome.
 _BARRIER_TIMEOUT_S = 60.0
+
+# Not a barrier: the deadlock-breaker for the property the concurrent-reader
+# test is named after. `_state_transaction` takes `_STATE_LOCK` with no timeout,
+# and the test's `release_post.set()` sits downstream of the call that would
+# block, so if the product ever held that lock across `_post_payload` this
+# expiry in the worker is the only thing that ends the run. It has to stay well
+# above the product's own transaction budgets — 1.0s and 5.0s — or a genuinely
+# slow run reads as a deadlock, and well below `_BARRIER_TIMEOUT_S`, or a
+# regression that blocks for tens of seconds and then completes stops failing
+# at all.
+_RELEASE_TIMEOUT_S = 10.0
 
 # Reaping a worker after ``terminate()`` is not a barrier: nothing is waiting on
 # the test any more, the signal has already been delivered, and a process that
@@ -629,7 +640,7 @@ def test_background_collection_does_not_wait_for_blocked_post_and_preserves_stat
     ) -> tuple[bool, str | None]:
         payloads.append(payload)
         post_started.set()
-        if not release_post.wait(timeout=_BARRIER_TIMEOUT_S):
+        if not release_post.wait(timeout=_RELEASE_TIMEOUT_S):
             return False, "test_release_timeout"
         return True, None
 
@@ -816,7 +827,15 @@ print(json.dumps({
         for worker in workers:
             if worker.poll() is None:
                 worker.terminate()
-                worker.wait(timeout=_REAP_TIMEOUT_S)
+                try:
+                    worker.wait(timeout=_REAP_TIMEOUT_S)
+                except subprocess.TimeoutExpired:
+                    # Without this the loop aborts on the first stuck worker and
+                    # the second is never signalled at all, leaving it to spin
+                    # inside `tmp_path` for its own barrier while pytest tries
+                    # to tear that directory down.
+                    worker.kill()
+                    worker.wait(timeout=_REAP_TIMEOUT_S)
 
     for worker, (stdout, stderr) in zip(workers, outputs, strict=True):
         assert worker.returncode == 0, stderr
