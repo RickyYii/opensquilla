@@ -61,6 +61,7 @@
       "tests/test_cli/test_chat_file_command.py",
       "tests/test_cli/test_chat_path_command.py",
       "tests/test_cli/test_ensemble_bench.py",
+      "tests/test_cli/test_failure_exit_codes.py",
       "tests/test_cli/test_onboard_cmd.py",
       "tests/test_cli/test_onboard_cmd_headless_semantics.py",
       "tests/test_cli/test_onboard_cmd_review_fixes.py",

@@ -13,14 +13,33 @@ from rich.table import Table
 
 from opensquilla.cli.chat.session_state import messages_to_markdown
 from opensquilla.cli.gateway_client import session_history_all
-from opensquilla.cli.gateway_rpc import default_gateway_url, run_gateway_sync
+from opensquilla.cli.gateway_rpc import (
+    default_gateway_url,
+    rpc_error_exit_code,
+    run_gateway_sync,
+)
 from opensquilla.cli.output import print_json
 from opensquilla.cli.ui import ACCENT, ACCENT_HEADER, console, error_panel
 
 app = typer.Typer(help="Manage chat sessions.")
 
 _CLIENT_UNAVAILABLE = object()
-_ACTION_FAILED = object()
+
+
+class _ActionFailed:
+    """A gateway RPC that returned an error, carrying the code for the exit status.
+
+    `run_gateway_call` — the path `sessions list`/`show`/`abort` take — maps the
+    gateway's error code through `rpc_error_exit_code` and raises `typer.Exit`.
+    The commands below handle their own connection so they can print a
+    command-specific hint, and used to drop the code on the floor along with the
+    failure itself. Keeping it here lets them exit the way their siblings do.
+    """
+
+    __slots__ = ("code",)
+
+    def __init__(self, code: str | None) -> None:
+        self.code = code
 
 
 def _resolved_key(payload: dict[str, Any], fallback: str) -> str:
@@ -120,7 +139,7 @@ async def _with_client(action):
         return _CLIENT_UNAVAILABLE
     except GatewayRPCError as exc:
         console.print(error_panel(str(exc)))
-        return _ACTION_FAILED
+        return _ActionFailed(getattr(exc, "code", None))
     finally:
         await client.close()
 
@@ -225,9 +244,9 @@ def sessions_resume(session_id: str = typer.Argument(..., help="Session ID to re
     result = asyncio.run(_with_client(_run))
     if result is _CLIENT_UNAVAILABLE:
         console.print(f"[dim]Session {session_id!r} requires a running gateway.[/dim]")
-        return
-    if result is _ACTION_FAILED:
-        return
+        raise typer.Exit(1)
+    if isinstance(result, _ActionFailed):
+        raise typer.Exit(rpc_error_exit_code(result.code))
     run_chat(session_id=_resolved_key(result, session_id))
 
 
@@ -274,9 +293,9 @@ def sessions_delete(
     result = asyncio.run(_with_client(_run))
     if result is _CLIENT_UNAVAILABLE:
         console.print("[dim]Session deletion requires a running gateway.[/dim]")
-        return
-    if result is _ACTION_FAILED:
-        return
+        raise typer.Exit(1)
+    if isinstance(result, _ActionFailed):
+        raise typer.Exit(rpc_error_exit_code(result.code))
     console.print_json(data=result)
 
 
@@ -305,12 +324,15 @@ def sessions_export(
     result: dict[str, Any] | None = asyncio.run(_with_client(_run))
     if result is _CLIENT_UNAVAILABLE:
         console.print("[dim]Session export requires a running gateway.[/dim]")
-        return
-    if result is _ACTION_FAILED:
-        return
+        raise typer.Exit(1)
+    if isinstance(result, _ActionFailed):
+        raise typer.Exit(rpc_error_exit_code(result.code))
     if result is None:
+        # No file is written on this path either, so a zero here would tell a
+        # caller its export succeeded and leave it looking for a file that
+        # was never created.
         console.print("[red]Session export returned no data.[/red]")
-        return
+        raise typer.Exit(1)
     target = output or Path(f"{session_id.replace(':', '-')}.{format}")
     if format == "json":
         target.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
