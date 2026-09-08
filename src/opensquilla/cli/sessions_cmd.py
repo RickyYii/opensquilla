@@ -70,14 +70,28 @@ def _row_datetime(row: dict[str, Any]) -> datetime | None:
     return None
 
 
-# The gateway derives a session's surface in `_derive_source_metadata` and
-# projects it under these names. A WebChat session comes back as
-# source_kind="webui" / channel_kind="webchat", a cron one as "cron"/"cron",
-# and the raw `channel` field stays null for both — which is why filtering on
-# `--channel webchat`, `webui` or `cron` matched nothing at all (#1538). The
-# `channel`/`last_channel` names are kept for gateways that predate the
-# derivation and for sessions that carry a real channel id.
+# A session row describes its surface three ways, and an operator typing
+# `--channel X` can mean any of them.
+#
+# `surface` (session_view._surface) is the platform, resolved through the
+# configured name->type map: a connector the operator named "飞书" or
+# "slack-eng" still reports `feishu` / `slack`. It is the only field that
+# answers `--channel telegram`, the example in docs/sessions.md, for a
+# connector not literally named "telegram".
+#
+# `channel_kind` (rpc_sessions._derive_source_metadata) is the operator's own
+# channel name, so it answers `--channel slack-eng`.
+#
+# `source_kind` is where the session came from — `webui`, `cli`, `subagent`,
+# `cron`. A WebChat session is source_kind="webui" / channel_kind="webchat"
+# with the raw `channel` field null, which is why `--channel webchat`, `webui`
+# and `cron` matched nothing at all before (#1538).
+#
+# The camelCase aliases are sent alongside each snake_case name. `channel` and
+# `last_channel` are matched too; nothing observed sends `source_channel`, but
+# they cost nothing and predate this filter.
 _CHANNEL_ROW_FIELDS = (
+    "surface",
     "source_kind",
     "sourceKind",
     "channel_kind",
@@ -89,17 +103,29 @@ _CHANNEL_ROW_FIELDS = (
     "sourceChannel",
 )
 
+# `source_kind` uses this as the bucket for "came from some channel", so every
+# channel-backed session carries it. It is a classification, not a channel
+# anyone can name, and matching it would make `--channel channel` return every
+# Slack, Discord and Feishu session at once.
+_CHANNEL_BUCKET_VALUE = "channel"
+
 
 def _row_matches_channel(row: dict[str, Any], channel: str) -> bool:
-    # Case-insensitive, matching how `--status` is compared inside the loop:
-    # these are gateway-side enum-ish names, and a capitalised argument
-    # silently returning nothing is the same defect in a smaller costume.
+    # Case-insensitive, matching how `--status` is compared inside the loop.
+    # The derived names are lowercase by construction; an operator's channel
+    # name is not, and a capitalised argument silently returning nothing is the
+    # same defect in a smaller costume.
     wanted = channel.strip().lower()
     if not wanted:
-        return True
+        # An all-whitespace argument matched nothing before this filter existed
+        # and still does. Quietly listing everything would be worse: the flag
+        # would look applied and not be.
+        return False
     for field in _CHANNEL_ROW_FIELDS:
         value = str(row.get(field) or "").strip().lower()
-        if value and value == wanted:
+        if not value or value == _CHANNEL_BUCKET_VALUE:
+            continue
+        if value == wanted:
             return True
     return False
 

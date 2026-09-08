@@ -263,7 +263,7 @@
     "tests/test_cli/test_skills_reload_cmd.py": 0.505,
     "tests/test_cli/test_skills_search_cmd.py": 0.684,
     "tests/test_cli/test_stdio_encoding.py": 0.01,
-    "tests/test_cli/test_surface_filter.py": 5.3,
+    "tests/test_cli/test_surface_filter.py": 4.31,
     "tests/test_cli/test_tui_meta_command.py": 0.018,
     "tests/test_cli/test_uninstall_cmd.py": 3.583,
     "tests/test_cli/test_url_utils.py": 0.01,
