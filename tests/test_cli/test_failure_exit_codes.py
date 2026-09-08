@@ -74,6 +74,29 @@ COMMANDS = {
 
 
 @pytest.mark.parametrize("name", sorted(COMMANDS))
+@pytest.mark.parametrize(
+    "failure",
+    [ConnectionRefusedError("connection refused"), OSError("socket closed")],
+    ids=["connection-refused", "os-error"],
+)
+def test_a_dropped_connection_reports_rather_than_traces(
+    name: str, failure: BaseException, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`run_gateway_call` turns these into a message and exit 1; so must these.
+
+    Left uncaught they reach Typer as an unhandled exception, so the operator
+    sees a traceback where the sibling commands print one line.
+    """
+
+    _install_client(monkeypatch, failure)
+
+    result = runner.invoke(app, COMMANDS[name])
+
+    assert result.exit_code == 1, result.stdout
+    assert result.exception is None or isinstance(result.exception, SystemExit)
+
+
+@pytest.mark.parametrize("name", sorted(COMMANDS))
 def test_an_unreachable_gateway_exits_one(name: str, monkeypatch: pytest.MonkeyPatch) -> None:
     _install_client(monkeypatch, SystemExit("gateway is not running"))
 

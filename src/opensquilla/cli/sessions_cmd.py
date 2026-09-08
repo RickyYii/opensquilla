@@ -140,6 +140,13 @@ async def _with_client(action):
     except GatewayRPCError as exc:
         console.print(error_panel(str(exc)))
         return _ActionFailed(getattr(exc, "code", None))
+    except (ConnectionError, OSError) as exc:
+        # `run_gateway_call` reports these as an unavailable gateway; here they
+        # were not caught at all, so a connection dropped mid-call reached
+        # Typer as an unhandled exception and the operator got a traceback
+        # where the sibling commands print one line.
+        console.print(error_panel(str(exc)))
+        return _CLIENT_UNAVAILABLE
     finally:
         await client.close()
 
