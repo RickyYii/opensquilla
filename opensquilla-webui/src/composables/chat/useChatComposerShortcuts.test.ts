@@ -326,6 +326,31 @@ describe('Escape and message edits', () => {
     expect(spies.cancelMessageEdit).toHaveBeenCalledOnce()
   })
 
+  it('reaches the cancel even with something queued', () => {
+    // The draft-clearing branch is inert when the queue is non-empty, and the
+    // cancel used to sit inside that guard: one queued message and edit mode
+    // had no exit at all, which is the defect being fixed one step along.
+    const { api, spies } = harness({
+      inputText: 'B',
+      pendingQueue: QUEUE,
+      cancelMessageEdit: () => true,
+    })
+
+    api.onTextareaKeydown(keydown({ key: 'Escape', target: field('B', 'end') }))
+
+    expect(spies.cancelMessageEdit).toHaveBeenCalledOnce()
+  })
+
+  it('leaves a queued Escape alone when no edit is live', () => {
+    const { api, inputText, spies } = harness({ inputText: 'draft', pendingQueue: QUEUE })
+
+    api.onTextareaKeydown(keydown({ key: 'Escape', target: field('draft', 'end') }))
+
+    expect(spies.cancelMessageEdit).toHaveBeenCalledOnce()
+    // Unchanged: with something queued this handler never cleared the draft.
+    expect(inputText.value).toBe('draft')
+  })
+
   it('still clears the draft when there is no edit to cancel', () => {
     const { api, inputText, spies } = harness({ inputText: 'just a draft' })
 

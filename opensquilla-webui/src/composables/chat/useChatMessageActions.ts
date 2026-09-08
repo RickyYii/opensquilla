@@ -54,6 +54,8 @@ interface EditRestorePoint {
   messages: ChatMessage[]
   /** Whatever the composer held before edit overwrote it with the message. */
   inputText: string
+  /** What edit put in the composer, so cancel can tell it apart from newer text. */
+  editedText: string
   /** Ties the restore point to the edit that made it; see `cancelEdit`. */
   forkBeforeMessageId: string
 }
@@ -224,6 +226,7 @@ export function useChatMessageActions(options: UseChatMessageActionsOptions) {
     editRestorePoint = {
       messages: options.messages.value,
       inputText: options.inputText.value,
+      editedText: text,
       forkBeforeMessageId,
     }
     options.pendingForkBeforeMessageId.value = forkBeforeMessageId
@@ -248,13 +251,23 @@ export function useChatMessageActions(options: UseChatMessageActionsOptions) {
   function cancelEdit(): boolean {
     const restore = editRestorePoint
     if (!restore) return false
-    editRestorePoint = null
     if (options.pendingForkBeforeMessageId.value !== restore.forkBeforeMessageId) {
+      // Drifted, so there is nothing safe to restore — but the point stays.
+      // Escape now consults this on every press, and discarding the undo on a
+      // press that could not use it would silently spend the one exit the user
+      // has.
       return false
     }
+    editRestorePoint = null
     options.pendingForkBeforeMessageId.value = null
     options.messages.value = restore.messages
-    options.inputText.value = restore.inputText
+    // Only put the old draft back over the text this edit itself wrote.
+    // Anything else in the composer arrived afterwards — a message popped off
+    // the pending queue, a draft recovered from a rejected send — and belongs
+    // to the user, not to the edit being cancelled.
+    if (options.inputText.value === restore.editedText) {
+      options.inputText.value = restore.inputText
+    }
     options.autoResizeTextarea()
     return true
   }

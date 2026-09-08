@@ -219,10 +219,57 @@ describe('useChatMessageActions branching edits', () => {
 
     expect(pendingForkBeforeMessageId.value).toBe('msg-A')
     expect(api.cancelEdit()).toBe(true)
-    // The second edit's restore point wins: back to what the first edit left,
-    // not to the untouched transcript. Cancelling one edit must not undo the
-    // other.
+    // The second edit's restore point replaces the first, so cancelling gets
+    // back only what the first edit left. Starting a second edit therefore
+    // spends the first one's undo: B and its reply are no longer reachable
+    // from here. Refusing the second edit while a restore frame is live would
+    // close that, and is a behaviour change beyond this fix.
     expect(options.messages.value.map(message => message.text)).toEqual(['A', 'ack A'])
+  })
+
+  it('keeps the restore point when the fork id has drifted', () => {
+    // Escape consults `cancelEdit` on every press now, so a press made while
+    // the frame is unusable must not spend the undo: the fork id can come back
+    // (a rejected send restores its own attempt), and the user still has only
+    // this one exit.
+    const { api, options, pendingForkBeforeMessageId } = makeOptions([
+      { role: 'user', text: 'A', ts: null, messageId: 'msg-A' },
+      { role: 'assistant', text: 'ack A', ts: null, messageId: 'msg-a1' },
+      { role: 'user', text: 'B', ts: null, messageId: 'msg-B' },
+    ])
+
+    api.editMessage(renderedMessage({
+      role: 'user', displayRole: 'user', sourceIndex: 2, messageId: 'msg-B', text: 'B',
+    }))
+    pendingForkBeforeMessageId.value = 'msg-other'
+    expect(api.cancelEdit()).toBe(false)
+
+    pendingForkBeforeMessageId.value = 'msg-B'
+    expect(api.cancelEdit()).toBe(true)
+    expect(options.messages.value.map(message => message.text)).toEqual(['A', 'ack A', 'B'])
+  })
+
+  it('leaves composer text the edit did not put there', () => {
+    // Between the edit and the Escape the composer can pick up text that is
+    // not the edited message — a pending item popped back with Alt+ArrowUp, a
+    // draft recovered from a rejected send. That text is the user's, and
+    // restoring the pre-edit draft over it would destroy it.
+    const { api, options } = makeOptions([
+      { role: 'user', text: 'A', ts: null, messageId: 'msg-A' },
+      { role: 'assistant', text: 'ack A', ts: null, messageId: 'msg-a1' },
+      { role: 'user', text: 'B', ts: null, messageId: 'msg-B' },
+    ])
+    options.inputText.value = 'older draft'
+
+    api.editMessage(renderedMessage({
+      role: 'user', displayRole: 'user', sourceIndex: 2, messageId: 'msg-B', text: 'B',
+    }))
+    expect(options.inputText.value).toBe('B')
+    options.inputText.value = 'popped off the queue'
+
+    expect(api.cancelEdit()).toBe(true)
+    expect(options.messages.value.map(message => message.text)).toEqual(['A', 'ack A', 'B'])
+    expect(options.inputText.value).toBe('popped off the queue')
   })
 
   it('records the previous user message id before regenerating', async () => {
