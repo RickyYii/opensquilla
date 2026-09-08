@@ -163,4 +163,35 @@ describe('useChatUsageWidget context usage', () => {
     })
     expect(above.contextWarning.value).toEqual(above.contextUsage.value)
   })
+
+  it('falls back to the quotient when the gateway sent no ratio at all', async () => {
+    // `normalizeContextStatus` runs `pressure` through `finiteNumber`, whose
+    // fallback is 0, so an omitted ratio arrives as a confident zero. Trusting
+    // it would print "0%" next to a tooltip reading 115k / 128k.
+    const api = await loadWithContextStatus({
+      contextTokens: 115_000,
+      contextWindowTokens: 128_000,
+      pressure: 0,
+      warningRatio: 0.85,
+    })
+
+    expect(api.contextUsage.value).toEqual({
+      pct: 89,
+      usedK: 115,
+      windowK: 128,
+      warning: true,
+    })
+  })
+
+  it('floors the percentage so a partly full window never reads as full', async () => {
+    // 99.5% rounds to 100, and a chip reading 100% says the window is gone.
+    const api = await loadWithContextStatus({
+      contextTokens: 127_360,
+      contextWindowTokens: 128_000,
+      pressure: 0.995,
+      warningRatio: 0.85,
+    })
+
+    expect(api.contextUsage.value?.pct).toBe(99)
+  })
 })

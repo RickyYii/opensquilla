@@ -722,8 +722,20 @@ describe('ChatHeaderActions', () => {
       chatHeaderActionsSource.indexOf('}', start),
     )
 
-    expect(rule).toContain('color: var(--warn);')
-    expect(rule).not.toContain('background: var(--warn-fill);')
-    expect(rule).toMatch(/background:\s*color-mix\(/)
+    // Compare declarations, not the raw text: `border-color: var(--warn);`
+    // contains `color: var(--warn);`, so a substring check passes on a rule
+    // that never sets a foreground colour at all.
+    const declarations = rule
+      .slice(rule.indexOf('{') + 1)
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .split(';')
+      .map((declaration) => declaration.trim())
+      .filter(Boolean)
+
+    expect(declarations).toContain('color: var(--warn)')
+    expect(declarations).not.toContain('background: var(--warn-fill)')
+    expect(declarations.some((declaration) => /^background:\s*color-mix\(/.test(declaration))).toBe(
+      true,
+    )
   })
 })

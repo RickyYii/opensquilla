@@ -37,7 +37,7 @@ export interface ContextUsage {
   warning: boolean
 }
 
-/** The above-threshold subset, kept as its own name for callers that only want it. */
+/** The above-threshold subset, under the name it had before the reading existed. */
 export type ContextWarning = ContextUsage
 
 export function createEmptyUsageAccumulator(): ChatUsageAccumulator {
@@ -74,14 +74,19 @@ export function useChatUsageWidget(options: UseChatUsageWidgetOptions) {
     const used = cs.contextTokens
     if (!(used >= 0)) return null
     const ratio = cs.warningRatio
-    // `pressure` is the gateway's own ratio; the quotient is the fallback for a
-    // gateway that omits it. `??` keeps a legitimate 0.
-    const reported = Number(cs.pressure ?? used / windowTokens)
+    // `pressure` is the gateway's own ratio, but the adapter substitutes 0 for
+    // a payload that omits it (`finiteNumber` in usageReportingV4), so a
+    // missing ratio is indistinguishable from a genuinely empty window at this
+    // layer. Falling back to the quotient whenever the counts disagree with a
+    // zero keeps that case from rendering a confident "0%" beside a tooltip
+    // reading 115k / 128k.
+    const reported = cs.pressure > 0 ? cs.pressure : used / windowTokens
     const pressure = Number.isFinite(reported)
       ? Math.min(1, Math.max(0, reported))
       : Math.min(1, used / windowTokens)
     return {
-      pct: Math.round(pressure * 100),
+      // Floor, not round: 99.5% must not present itself as a full window.
+      pct: Math.floor(pressure * 100),
       usedK: Math.round(used / 1000),
       windowK: Math.round(windowTokens / 1000),
       warning: ratio > 0 && pressure >= ratio,
