@@ -18,12 +18,13 @@ from opensquilla.cli.gateway_rpc import (
     rpc_error_exit_code,
     run_gateway_sync,
 )
-from opensquilla.cli.output import print_json
-from opensquilla.cli.ui import ACCENT, ACCENT_HEADER, console, error_panel
+from opensquilla.cli.output import emit_error, print_json
+from opensquilla.cli.ui import ACCENT, ACCENT_HEADER, console, error_console
 
 app = typer.Typer(help="Manage chat sessions.")
 
 _CLIENT_UNAVAILABLE = object()
+_CONNECTION_LOST = object()
 
 
 class _ActionFailed:
@@ -135,18 +136,24 @@ async def _with_client(action):
         await client.connect(default_gateway_url())
         return await action(client)
     except SystemExit as exc:
-        console.print(f"[dim]{exc}[/dim]")
+        emit_error(str(exc), code="GATEWAY_UNAVAILABLE")
         return _CLIENT_UNAVAILABLE
     except GatewayRPCError as exc:
-        console.print(error_panel(str(exc)))
-        return _ActionFailed(getattr(exc, "code", None))
+        # stderr, where the shared path puts it. `sessions delete` prints its
+        # result as JSON on stdout, so a diagnostic written there would land in
+        # the stream a caller is parsing. The text is what this file already
+        # showed: `str(exc)` carries the method and the code.
+        emit_error(str(exc), code=exc.code)
+        return _ActionFailed(exc.code)
     except (ConnectionError, OSError) as exc:
-        # `run_gateway_call` reports these as an unavailable gateway; here they
-        # were not caught at all, so a connection dropped mid-call reached
-        # Typer as an unhandled exception and the operator got a traceback
-        # where the sibling commands print one line.
-        console.print(error_panel(str(exc)))
-        return _CLIENT_UNAVAILABLE
+        # Uncaught before, so a connection dropped mid-call reached Typer as an
+        # unhandled exception and the operator got a traceback where the
+        # sibling commands print one line. It gets its own sentinel: the
+        # gateway answered and then went away, which is not the same as never
+        # having been there, and the callers' "requires a running gateway"
+        # hint would be a wrong diagnosis.
+        emit_error(str(exc), code="GATEWAY_UNAVAILABLE")
+        return _CONNECTION_LOST
     finally:
         await client.close()
 
@@ -250,7 +257,9 @@ def sessions_resume(session_id: str = typer.Argument(..., help="Session ID to re
 
     result = asyncio.run(_with_client(_run))
     if result is _CLIENT_UNAVAILABLE:
-        console.print(f"[dim]Session {session_id!r} requires a running gateway.[/dim]")
+        error_console.print(f"[dim]Session {session_id!r} requires a running gateway.[/dim]")
+        raise typer.Exit(1)
+    if result is _CONNECTION_LOST:
         raise typer.Exit(1)
     if isinstance(result, _ActionFailed):
         raise typer.Exit(rpc_error_exit_code(result.code))
@@ -299,7 +308,9 @@ def sessions_delete(
 
     result = asyncio.run(_with_client(_run))
     if result is _CLIENT_UNAVAILABLE:
-        console.print("[dim]Session deletion requires a running gateway.[/dim]")
+        error_console.print("[dim]Session deletion requires a running gateway.[/dim]")
+        raise typer.Exit(1)
+    if result is _CONNECTION_LOST:
         raise typer.Exit(1)
     if isinstance(result, _ActionFailed):
         raise typer.Exit(rpc_error_exit_code(result.code))
@@ -318,7 +329,7 @@ def sessions_export(
     falls back to session preview when no messages are available.
     """
     if format not in {"md", "json"}:
-        console.print("[red]--format must be md or json[/red]")
+        emit_error("--format must be md or json", code="INVALID_REQUEST")
         raise typer.Exit(2)
 
     async def _run(client):
@@ -330,19 +341,18 @@ def sessions_export(
 
     result: dict[str, Any] | None = asyncio.run(_with_client(_run))
     if result is _CLIENT_UNAVAILABLE:
-        console.print("[dim]Session export requires a running gateway.[/dim]")
+        error_console.print("[dim]Session export requires a running gateway.[/dim]")
+        raise typer.Exit(1)
+    if result is _CONNECTION_LOST:
         raise typer.Exit(1)
     if isinstance(result, _ActionFailed):
         raise typer.Exit(rpc_error_exit_code(result.code))
     if result is None:
-        # No file is written on this path either, so a zero here would tell a
-        # caller its export succeeded and leave it looking for a file that
-        # was never created.
-        console.print("[red]Session export returned no data.[/red]")
+        emit_error("Session export returned no data.")
         raise typer.Exit(1)
     target = output or Path(f"{session_id.replace(':', '-')}.{format}")
     if format == "json":
-        target.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+        body = json.dumps(result, ensure_ascii=False, indent=2)
     else:
         resolved = result.get("resolved", {})
         key = _resolved_key(resolved, session_id)
@@ -359,5 +369,14 @@ def sessions_export(
             f"- Updated: {resolved.get('updated_at', '')}\n\n"
             f"{transcript}"
         )
+    try:
         target.write_text(body, encoding="utf-8")
+    except OSError as exc:
+        # A missing parent directory or an unwritable path reached Typer as an
+        # unhandled exception, so `--output` into a bad path printed a
+        # traceback. The exit status was already non-zero; this only makes the
+        # failure readable, and matches the one line the rest of the command
+        # prints.
+        emit_error(f"Could not write {target}: {exc}")
+        raise typer.Exit(1) from exc
     console.print(f"[green]Exported:[/green] {target}")

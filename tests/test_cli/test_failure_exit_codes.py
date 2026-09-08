@@ -3,10 +3,9 @@
 `sessions resume`, `delete` and `export` open their own gateway connection so
 they can print a command-specific hint. That helper swallowed every failure
 into a sentinel and each caller returned, so the process exited 0 whether the
-gateway was unreachable, the RPC returned an error, or nothing came back —
-issue #1448. `export` is the reported case: a caller running
-`sessions export KEY && upload KEY.md` proceeded to a file that was never
-written.
+gateway was unreachable or the RPC returned an error — issue #1448. `export`
+is the reported case: a caller running `sessions export KEY && upload KEY.md`
+proceeded to a file that was never written.
 
 Their siblings — `list`, `show`, `abort` — go through `run_gateway_call`,
 which maps the gateway's error code with `rpc_error_exit_code` and raises.
@@ -94,6 +93,7 @@ def test_a_dropped_connection_reports_rather_than_traces(
 
     assert result.exit_code == 1, result.stdout
     assert result.exception is None or isinstance(result.exception, SystemExit)
+    assert result.stderr.strip(), "the failure has to be reported somewhere"
 
 
 @pytest.mark.parametrize("name", sorted(COMMANDS))
@@ -118,40 +118,12 @@ def test_an_rpc_error_exits_with_the_shared_mapping(
 ) -> None:
     """The same mapping `list`/`show`/`abort` get from `run_gateway_call`."""
 
-    _install_client(monkeypatch, GatewayRPCError("boom", code=code))
+    _install_client(monkeypatch, GatewayRPCError("sessions.delete", code=code, message="boom"))
 
     result = runner.invoke(app, COMMANDS[name])
 
     assert result.exit_code == expected, result.stdout
-
-
-def test_export_exits_non_zero_when_no_data_comes_back(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """No file is written on this path, so zero would be a lie about the file."""
-
-    class EmptyClient:
-        async def connect(self, url: str, *, token: str | None = None) -> None:
-            return None
-
-        async def close(self) -> None:
-            return None
-
-    monkeypatch.setattr("opensquilla.cli.gateway_client.GatewayClient", EmptyClient)
-    monkeypatch.setattr(
-        "opensquilla.cli.sessions_cmd._with_client",
-        _returning_none,
-    )
-
-    target = tmp_path / "out.md"
-    result = runner.invoke(app, ["sessions", "export", SESSION, "--output", str(target)])
-
-    assert result.exit_code == 1, result.stdout
-    assert not target.exists()
-
-
-async def _returning_none(action: Any) -> None:
-    return None
+    assert "boom" in result.stderr and "sessions.delete" in result.stderr
 
 
 def test_a_successful_export_still_exits_zero_and_writes(
@@ -166,3 +138,55 @@ def test_a_successful_export_still_exits_zero_and_writes(
 
     assert result.exit_code == 0, result.stdout
     assert target.exists()
+
+
+def test_a_failed_delete_leaves_stdout_parseable(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`sessions delete` writes its result as JSON on stdout.
+
+    A diagnostic printed there too would land in the stream a caller is
+    parsing, so the error panel has to go to stderr.
+    """
+
+    _install_client(
+        monkeypatch,
+        GatewayRPCError("sessions.delete", code="NOT_FOUND", message="boom"),
+    )
+
+    result = runner.invoke(app, COMMANDS["delete"])
+
+    assert result.exit_code == 2
+    assert result.stdout.strip() == ""
+    assert "boom" in result.stderr and "sessions.delete" in result.stderr
+
+
+def test_an_unwritable_output_path_reports_rather_than_traces(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The transcript arrived; only the file write failed.
+
+    Uncaught, it reached Typer as an unhandled exception and printed a
+    traceback — the same defect the connection paths above had.
+    """
+
+    _install_client(monkeypatch, None)
+
+    target = tmp_path / "missing" / "out.md"
+    result = runner.invoke(app, ["sessions", "export", SESSION, "--output", str(target)])
+
+    assert result.exit_code == 1, result.stdout
+    assert result.exception is None or isinstance(result.exception, SystemExit)
+    assert str(target) in result.stderr
+    assert not target.exists()
+
+
+def test_a_bad_format_is_reported_on_stderr(tmp_path: Path) -> None:
+    """Argument rejection is a failure too, and exits 2 like the RPC's."""
+
+    result = runner.invoke(
+        app,
+        ["sessions", "export", SESSION, "--format", "yaml", "--output", str(tmp_path / "o")],
+    )
+
+    assert result.exit_code == 2
+    assert "--format" in result.stderr
+    assert result.stdout.strip() == ""
