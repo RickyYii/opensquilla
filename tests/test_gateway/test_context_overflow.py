@@ -313,6 +313,67 @@ def test_gateway_memory_flush_triggers_reject_unknown_values(
         GatewayConfig(memory={"flush_triggers": flush_triggers})
 
 
+@pytest.mark.parametrize("budget", [0, -1, -100_000])
+def test_context_budget_tokens_rejects_a_non_positive_budget(budget: int) -> None:
+    """Four readers, four different meanings for the same non-positive value.
+
+    `apply_context_overflow_policy` compares against it literally, so every
+    turn goes over budget; `compaction_target` reads it as "no application
+    cap" and skips the `min()`; the session maintenance port raises
+    "contextWindowTokens must be a positive integer"; and `engine/runtime`
+    falls through its `or` chain to 100_000. A deployment that sets one
+    cannot be given a single answer, so refuse it at load.
+    """
+
+    with pytest.raises(ValueError, match="greater than 0"):
+        GatewayConfig(context_budget_tokens=budget)
+
+
+def test_context_budget_tokens_still_takes_any_positive_budget() -> None:
+    """The constraint must not narrow a deployment's real choices."""
+
+    assert GatewayConfig(context_budget_tokens=1).context_budget_tokens == 1
+    assert GatewayConfig(context_budget_tokens=8_000).context_budget_tokens == 8_000
+    assert GatewayConfig().context_budget_tokens == 100_000
+
+
+@pytest.mark.asyncio
+async def test_a_zero_budget_put_every_turn_over_the_limit() -> None:
+    """What the rejected value did on the path that read it literally.
+
+    `budget_override` carries the same number `context_budget_tokens` used to
+    supply, and it has no production callers, so this is the behaviour the
+    constraint removes: a two-character message clears a zero budget, and
+    under REFUSE the deployment answered nothing at all.
+    """
+
+    cfg = GatewayConfig(context_overflow_policy=ContextOverflowPolicy.REFUSE)
+
+    zero = await apply_context_overflow_policy(
+        config=cfg,
+        message="hi",
+        transcript=[],
+        session_key="s-zero-budget",
+        session_manager=None,
+        budget_override=0,
+    )
+
+    assert zero.estimated_tokens > 0
+    assert zero.over_budget is True
+    assert zero.refusal is not None
+
+    default = await apply_context_overflow_policy(
+        config=cfg,
+        message="hi",
+        transcript=[],
+        session_key="s-default-budget",
+        session_manager=None,
+    )
+
+    assert default.over_budget is False
+    assert default.refusal is None
+
+
 def _history(n_entries: int, chars_per_entry: int) -> list[_FakeEntry]:
     # estimate_tokens rounds chars/4, so ~4 chars ≈ 1 token.
     return [_FakeEntry(content="x" * chars_per_entry) for _ in range(n_entries)]

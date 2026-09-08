@@ -2706,7 +2706,13 @@ class GatewayConfig(BaseSettings):
     # Budget and policy consulted in gateway/rpc_chat.py before dispatching
     # a turn. ``context_budget_tokens`` is a soft cap: when an estimated
     # turn payload exceeds this, the policy branch fires.
-    context_budget_tokens: int = 100_000
+    # Validated here because its readers disagree about what a non-positive
+    # value means: the overflow policy puts every turn over budget,
+    # ``compaction_target`` reads it as "no application cap", the session
+    # maintenance port raises, and the engine falls back to 100_000. A
+    # deployment that sets one cannot be given a single answer, so refuse it
+    # at load instead of picking one of the four at random.
+    context_budget_tokens: int = Field(default=100_000, gt=0)
     context_overflow_policy: ContextOverflowPolicy = ContextOverflowPolicy.AUTO_SUMMARIZE
     preflight_compact_ratio: float = Field(default=0.85, gt=0.0, le=1.0)
 
