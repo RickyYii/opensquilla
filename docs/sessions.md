@@ -33,11 +33,17 @@ opensquilla gateway status
 ```sh
 opensquilla sessions list
 opensquilla sessions list --limit 20
-opensquilla sessions list --status idle
+opensquilla sessions list --status running
 opensquilla sessions list --agent main
 opensquilla sessions list --channel telegram
 opensquilla sessions list --since 2026-05-01
 ```
+
+`--status` takes a `SessionStatus`: `running`, `done`, `failed`, `killed` or
+`timeout`. `--channel` takes either the platform (`slack`, `telegram`,
+`feishu`, ...) or the name you gave the connector, and also accepts the
+non-channel sources a session can have — `webchat`, `webui`, `cli`, `cron`,
+`subagent`. Both are matched case-insensitively.
 
 Use `--json` for scripts:
 

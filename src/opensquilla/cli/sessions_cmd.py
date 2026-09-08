@@ -89,7 +89,10 @@ def _row_datetime(row: dict[str, Any]) -> datetime | None:
 #
 # The camelCase aliases are sent alongside each snake_case name. `channel` and
 # `last_channel` are matched too; nothing observed sends `source_channel`, but
-# they cost nothing and predate this filter.
+# they cost nothing and predate this filter. `channel_id` is deliberately left
+# out: it is the platform's own room id (`last_to`), not a channel anyone
+# names, and folding it in would let a bare id shadow a connector called the
+# same thing.
 _CHANNEL_ROW_FIELDS = (
     "surface",
     "source_kind",

@@ -104,9 +104,7 @@ ALL = [WEBCHAT, CRON, SLACK]
         ("slack-eng", ["agent:main:slack:channel:C9"]),
     ],
 )
-def test_each_way_a_row_names_its_surface_is_matched(
-    channel: str, expected: list[str]
-) -> None:
+def test_each_way_a_row_names_its_surface_is_matched(channel: str, expected: list[str]) -> None:
     assert _keys(_filter(ALL, channel)) == expected
 
 
@@ -195,9 +193,21 @@ def test_the_other_filters_still_compose() -> None:
     assert _keys(
         _filter_sessions(ALL, agent="reminders", status=None, channel=None, since=None)
     ) == ["cron:nightly:s2"]
-    assert _keys(
-        _filter_sessions(ALL, agent=None, status="done", channel="slack", since=None)
-    ) == ["agent:main:slack:channel:C9"]
-    assert (
-        _filter_sessions(ALL, agent="main", status=None, channel="cron", since=None) == []
-    )
+    assert _keys(_filter_sessions(ALL, agent=None, status="done", channel="slack", since=None)) == [
+        "agent:main:slack:channel:C9"
+    ]
+    assert _filter_sessions(ALL, agent="main", status=None, channel="cron", since=None) == []
+
+
+def test_a_platform_room_id_is_not_a_channel_name() -> None:
+    """`channel_id` is the platform's own room id, deliberately left out.
+
+    Folding it in would let a bare id shadow a connector named the same thing.
+    """
+
+    slack = dict(SLACK)
+    slack["channel_id"] = "C9"
+    slack["channelId"] = "C9"
+
+    assert _filter([slack], "C9") == []
+    assert _keys(_filter([slack], "slack-eng")) == ["agent:main:slack:channel:C9"]
