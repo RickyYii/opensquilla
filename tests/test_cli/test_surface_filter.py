@@ -18,11 +18,14 @@ filter bug.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
 from opensquilla.cli.sessions_cmd import _filter_sessions
+from opensquilla.gateway.rpc_sessions import _derive_source_metadata
+from opensquilla.gateway.session_view import build_session_view_item
 
 
 def _row(**overrides: Any) -> dict[str, Any]:
@@ -109,14 +112,50 @@ def test_each_way_a_row_names_its_surface_is_matched(channel: str, expected: lis
 
 
 def test_the_generic_bucket_is_not_a_channel() -> None:
-    """`source_kind == "channel"` classifies; it is not something to filter on.
+    """`source_kind`'s "channel" classifies; it is not something to filter on.
 
-    Every channel-backed session carries it, so matching it would make
-    `--channel channel` return all of them at once under a name no operator
-    chose.
+    A session that arrived over a connector falls back to it, so matching it
+    would return all of them at once under a name no operator chose.
     """
 
     assert _filter(ALL, "channel") == []
+
+
+def test_the_unplaceable_surface_is_not_a_channel_either() -> None:
+    """`_surface` ends in "unknown" for a session it could not place.
+
+    `session/keys.py` even builds keys with "unknown" in the channel slot, so
+    the sentinel is common. It is the same defect as the `channel` bucket:
+    matching it hands back every unplaceable session under a name nobody
+    chose.
+    """
+
+    unplaceable = _row(key="mystery:1", surface="unknown")
+
+    assert _filter([unplaceable, WEBCHAT, SLACK], "unknown") == []
+
+
+@pytest.mark.parametrize("reserved", ["channel", "unknown"])
+def test_a_connector_actually_named_after_a_sentinel_is_still_reachable(
+    reserved: str,
+) -> None:
+    """Connector names are free text, so both words are ones an operator can use.
+
+    Skipping the sentinel globally would drop these rows, which is the same
+    silent empty result this filter exists to remove.
+    """
+
+    named = _row(
+        key=f"agent:main:{reserved}:channel:C4",
+        source_kind="channel",
+        sourceKind="channel",
+        channel_kind=reserved,
+        channelKind=reserved,
+        last_channel=reserved,
+        surface="unknown",
+    )
+
+    assert _keys(_filter([named, WEBCHAT], reserved)) == [f"agent:main:{reserved}:channel:C4"]
 
 
 def test_a_row_that_only_resolved_a_surface_is_still_reachable() -> None:
@@ -165,11 +204,54 @@ def test_a_gateway_that_predates_the_derivation_still_filters() -> None:
 
 
 def test_blank_values_never_match() -> None:
-    """Empty strings in the row must not collide with each other."""
+    """A row of empty strings must not answer to an empty-ish argument.
 
-    blank = _row(key="blank:1", channel="", source_kind="", surface="")
+    Asking for a name the row does not carry would pass with or without the
+    guard; the guard is what stops the blanks matching each other.
+    """
+
+    blank = _row(key="blank:1", channel="", source_kind="", channel_kind="", surface="")
 
     assert _filter([blank], "webchat") == []
+    assert _filter([blank], "  ") == []
+    # An empty string is falsy, so `_filter_sessions` skips the channel test
+    # entirely — the same as not passing the flag, and what it did before.
+    assert _keys(_filter([blank], "")) == ["blank:1"]
+
+
+def test_surrounding_whitespace_in_a_row_value_is_ignored() -> None:
+    """A connector name stored with stray whitespace still answers to itself."""
+
+    padded = _row(key="padded:1", channel_kind="  slack-eng\n", surface="slack")
+
+    assert _keys(_filter([padded], "slack-eng")) == ["padded:1"]
+
+
+def test_the_legacy_source_channel_fields_are_matched() -> None:
+    """Carried over from the filter this replaces; nothing else covers them."""
+
+    snake = _row(key="src:1", source_channel="discord", surface="unknown")
+    camel = _row(key="src:2", sourceChannel="discord", surface="unknown")
+
+    assert _keys(_filter([snake, camel, WEBCHAT], "discord")) == ["src:1", "src:2"]
+
+
+def test_an_expanded_channel_object_is_matched_by_name_and_type() -> None:
+    """`sessions.list` types `channel` as `dict | str | None`.
+
+    Stringifying the object yields `"{'name': ...}"`, which answers to
+    nothing; the operator's name and the platform both have to come out.
+    """
+
+    expanded = _row(
+        key="obj:1",
+        channel={"name": "slack-eng", "type": "slack"},
+        surface="unknown",
+    )
+
+    assert _keys(_filter([expanded], "slack-eng")) == ["obj:1"]
+    assert _keys(_filter([expanded], "slack")) == ["obj:1"]
+    assert _filter([expanded], "discord") == []
 
 
 def test_a_row_whose_origin_and_platform_disagree_answers_to_both() -> None:
@@ -211,3 +293,83 @@ def test_a_platform_room_id_is_not_a_channel_name() -> None:
 
     assert _filter([slack], "C9") == []
     assert _keys(_filter([slack], "slack-eng")) == ["agent:main:slack:channel:C9"]
+
+
+def _projected_row(session: SimpleNamespace, channel_types: dict[str, str] | None = None) -> dict:
+    """Build a row the way `_handle_sessions_list` does.
+
+    `rpc_sessions.py` merges `_derive_source_metadata` and then
+    `build_session_view_item` onto the base row, and the contract adapter
+    returns the payload unchanged, so these are the field names that reach the
+    CLI. Every hand-written row above is a claim about this function; this is
+    the one place the claim is checked against the producers themselves.
+    """
+
+    row: dict[str, Any] = {
+        "key": session.session_key,
+        "status": getattr(session, "status", "unknown"),
+        "channel": getattr(session, "channel", None),
+    }
+    row.update(_derive_source_metadata(session))
+    row.update(
+        build_session_view_item(
+            session,
+            entry_count=0,
+            task_rows=[],
+            now_ms=0,
+            channel_types=channel_types,
+        )
+    )
+    return row
+
+
+def _session(session_key: str, **overrides: Any) -> SimpleNamespace:
+    fields: dict[str, Any] = {
+        "session_key": session_key,
+        "session_id": session_key,
+        "agent_id": "main",
+        "origin": None,
+        "channel": None,
+        "last_channel": None,
+        "last_to": None,
+        "status": "done",
+        "created_at": None,
+        "updated_at": None,
+        "model": None,
+        "title": None,
+    }
+    fields.update(overrides)
+    return SimpleNamespace(**fields)
+
+
+def test_the_gateway_really_sends_the_fields_this_filter_reads() -> None:
+    """The whole fix rests on `surface` and the derived kinds being on the wire."""
+
+    webchat = _projected_row(_session("agent:main:webchat:s1"))
+    cron = _projected_row(_session("cron:nightly:s2"))
+    slack = _projected_row(
+        _session("agent:main:slack-eng:channel:C9", last_channel="slack-eng"),
+        channel_types={"slack-eng": "slack"},
+    )
+    rows = [webchat, cron, slack]
+
+    # The names the old filter looked at carry nothing for the first two.
+    assert webchat["channel"] is None
+    assert cron["channel"] is None
+
+    assert _keys(_filter(rows, "webchat")) == ["agent:main:webchat:s1"]
+    assert _keys(_filter(rows, "webui")) == ["agent:main:webchat:s1"]
+    assert _keys(_filter(rows, "cron")) == ["cron:nightly:s2"]
+    # The platform, resolved through the configured name->type map...
+    assert _keys(_filter(rows, "slack")) == ["agent:main:slack-eng:channel:C9"]
+    # ...and the name the operator actually gave that connector.
+    assert _keys(_filter(rows, "slack-eng")) == ["agent:main:slack-eng:channel:C9"]
+
+
+def test_a_session_the_gateway_cannot_place_is_not_swept_up() -> None:
+    """`_surface` really does end at the "unknown" sentinel."""
+
+    unplaceable = _projected_row(_session("mystery-key"))
+
+    assert unplaceable["surface"] == "unknown"
+    assert _filter([unplaceable], "unknown") == []

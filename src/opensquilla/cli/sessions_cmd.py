@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -82,10 +83,11 @@ def _row_datetime(row: dict[str, Any]) -> datetime | None:
 # `channel_kind` (rpc_sessions._derive_source_metadata) is the operator's own
 # channel name, so it answers `--channel slack-eng`.
 #
-# `source_kind` is where the session came from — `webui`, `cli`, `subagent`,
-# `cron`. A WebChat session is source_kind="webui" / channel_kind="webchat"
-# with the raw `channel` field null, which is why `--channel webchat`, `webui`
-# and `cron` matched nothing at all before (#1538).
+# `source_kind` is where the session came from — the origin's own kind, or
+# `webui` / `cli` / `subagent` / `cron`. A WebChat session is
+# source_kind="webui" / channel_kind="webchat" with the raw `channel` field
+# null, which is why `--channel webchat`, `webui` and `cron` matched nothing at
+# all before (#1538).
 #
 # The camelCase aliases are sent alongside each snake_case name. `channel` and
 # `last_channel` are matched too; nothing observed sends `source_channel`, but
@@ -106,31 +108,55 @@ _CHANNEL_ROW_FIELDS = (
     "sourceChannel",
 )
 
-# `source_kind` uses this as the bucket for "came from some channel", so every
-# channel-backed session carries it. It is a classification, not a channel
-# anyone can name, and matching it would make `--channel channel` return every
-# Slack, Discord and Feishu session at once.
-_CHANNEL_BUCKET_VALUE = "channel"
+# Two of these fields end in a value that classifies rather than names, and
+# both words are ones an operator could have called a connector. `source_kind`
+# falls back to "channel" for a session that arrived over one, and `_surface`
+# returns "unknown" for a session it could not place at all — `session/keys.py`
+# even builds keys with "unknown" in the channel slot. Matching either would
+# hand back every channel session, or every unplaceable one, under a name
+# nobody chose. Skipping them per field rather than globally keeps a connector
+# actually named `channel` or `unknown` reachable through the fields that carry
+# the operator's own name.
+_CLASSIFYING_VALUES = {
+    "source_kind": "channel",
+    "sourceKind": "channel",
+    "surface": "unknown",
+}
+
+
+def _row_channel_values(row: dict[str, Any]) -> Iterator[str]:
+    """Yield every lowercased name this row answers to."""
+
+    for field in _CHANNEL_ROW_FIELDS:
+        raw = row.get(field)
+        if isinstance(raw, dict):
+            # `sessions.list` types `channel` as `dict | str | None`; the
+            # object form keeps the operator's name and the platform apart,
+            # and an operator may type either.
+            candidates: tuple[Any, ...] = (raw.get("name"), raw.get("type"))
+        else:
+            candidates = (raw,)
+        for candidate in candidates:
+            value = str(candidate or "").strip().lower()
+            if value and value != _CLASSIFYING_VALUES.get(field):
+                yield value
 
 
 def _row_matches_channel(row: dict[str, Any], channel: str) -> bool:
     # Case-insensitive, matching how `--status` is compared inside the loop.
-    # The derived names are lowercase by construction; an operator's channel
-    # name is not, and a capitalised argument silently returning nothing is the
-    # same defect in a smaller costume.
+    # `surface` and the derived kinds are lowercase, but `channel_kind` is the
+    # connector's configured name copied verbatim, so `Slack-Eng` reaches here
+    # as written; a capitalised argument silently returning nothing is the same
+    # defect in a smaller costume.
     wanted = channel.strip().lower()
     if not wanted:
         # An all-whitespace argument matched nothing before this filter existed
         # and still does. Quietly listing everything would be worse: the flag
-        # would look applied and not be.
+        # would look applied and not be. An empty string never reaches here —
+        # it is falsy, so the caller skips the test the way it does when the
+        # flag is absent.
         return False
-    for field in _CHANNEL_ROW_FIELDS:
-        value = str(row.get(field) or "").strip().lower()
-        if not value or value == _CHANNEL_BUCKET_VALUE:
-            continue
-        if value == wanted:
-            return True
-    return False
+    return any(value == wanted for value in _row_channel_values(row))
 
 
 def _filter_sessions(
@@ -185,7 +211,11 @@ def sessions_list(
     limit: int = typer.Option(50, "--limit", "-n", help="Maximum rows"),
     agent: str | None = typer.Option(None, "--agent", help="Filter by agent id"),
     status: str | None = typer.Option(None, "--status", help="Filter by session status"),
-    channel: str | None = typer.Option(None, "--channel", help="Filter by channel/source"),
+    channel: str | None = typer.Option(
+        None,
+        "--channel",
+        help="Filter by platform, connector name, or source (webchat/webui/cli/cron/subagent)",
+    ),
     since: str | None = typer.Option(None, "--since", help="ISO date/datetime or epoch timestamp"),
     json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON"),
 ) -> None:

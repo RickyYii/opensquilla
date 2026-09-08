@@ -39,11 +39,17 @@ opensquilla sessions list --channel telegram
 opensquilla sessions list --since 2026-05-01
 ```
 
-`--status` takes a `SessionStatus`: `running`, `done`, `failed`, `killed` or
-`timeout`. `--channel` takes either the platform (`slack`, `telegram`,
-`feishu`, ...) or the name you gave the connector, and also accepts the
-non-channel sources a session can have — `webchat`, `webui`, `cli`, `cron`,
-`subagent`. Both are matched case-insensitively.
+`--status` matches the session's stored status, normally one of `running`,
+`done`, `failed`, `killed` and `timeout`; a row whose status is missing
+reports `unknown`. `--channel` takes either the platform (`slack`,
+`telegram`, `feishu`, ...) or the name you gave the connector, and also
+accepts the non-channel sources a session can have — `webchat`, `webui`,
+`cli`, `cron`, `subagent`. Both are matched case-insensitively.
+
+All four filters run on the client, over the page `--limit` asked for
+(default 50). Raise `--limit` when you are looking for something older than
+the most recent 50 sessions, or the filter will report nothing rather than
+searching further back.
 
 Use `--json` for scripts:
 
