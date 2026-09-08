@@ -70,6 +70,40 @@ def _row_datetime(row: dict[str, Any]) -> datetime | None:
     return None
 
 
+# The gateway derives a session's surface in `_derive_source_metadata` and
+# projects it under these names. A WebChat session comes back as
+# source_kind="webui" / channel_kind="webchat", a cron one as "cron"/"cron",
+# and the raw `channel` field stays null for both — which is why filtering on
+# `--channel webchat`, `webui` or `cron` matched nothing at all (#1538). The
+# `channel`/`last_channel` names are kept for gateways that predate the
+# derivation and for sessions that carry a real channel id.
+_CHANNEL_ROW_FIELDS = (
+    "source_kind",
+    "sourceKind",
+    "channel_kind",
+    "channelKind",
+    "channel",
+    "last_channel",
+    "lastChannel",
+    "source_channel",
+    "sourceChannel",
+)
+
+
+def _row_matches_channel(row: dict[str, Any], channel: str) -> bool:
+    # Case-insensitive, matching how `--status` is compared inside the loop:
+    # these are gateway-side enum-ish names, and a capitalised argument
+    # silently returning nothing is the same defect in a smaller costume.
+    wanted = channel.strip().lower()
+    if not wanted:
+        return True
+    for field in _CHANNEL_ROW_FIELDS:
+        value = str(row.get(field) or "").strip().lower()
+        if value and value == wanted:
+            return True
+    return False
+
+
 def _filter_sessions(
     rows: list[dict[str, Any]],
     *,
@@ -84,16 +118,8 @@ def _filter_sessions(
             continue
         if status and str(row.get("status") or "").lower() != status.lower():
             continue
-        if channel:
-            channel_values = {
-                str(row.get("channel") or ""),
-                str(row.get("last_channel") or ""),
-                str(row.get("lastChannel") or ""),
-                str(row.get("source_channel") or ""),
-                str(row.get("sourceChannel") or ""),
-            }
-            if channel not in channel_values:
-                continue
+        if channel and not _row_matches_channel(row, channel):
+            continue
         if since:
             updated = _row_datetime(row)
             if updated is None or updated < since:
