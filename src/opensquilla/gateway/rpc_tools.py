@@ -15,6 +15,7 @@ from opensquilla.sandbox.integration import (
     get_runtime,
     run_in_process_network_action,
 )
+from opensquilla.sandbox.policy_store import pin_sandbox_policy
 from opensquilla.sandbox.run_context import RunContext
 from opensquilla.sandbox.types import DenialResult
 from opensquilla.tools.builtin.web import (
@@ -122,16 +123,13 @@ async def read_search_status(params: dict | None, ctx: RpcContext) -> dict[str, 
     if params is not None and not isinstance(params, dict):
         raise ValueError("params must be an object")
     provider = (params or {}).get("provider")
-    # `_read_search_status` probes `in_process_network_precondition()` to fill
-    # `networkReady`. Probing it outside the context `search.query` establishes
-    # reports the refusal the query no longer meets — the same disagreement as
-    # #1202, seen from the readiness side — so the projection runs under the
-    # same context here.
-    with _operator_network_context():
-        return _read_search_status(str(provider) if provider else None)
+    return _read_search_status(
+        str(provider) if provider else None,
+        probe_context=lambda: operator_network_context(ctx),
+    )
 
 
-def _operator_network_tool_context() -> ToolContext:
+def _operator_network_tool_context(ctx: RpcContext) -> ToolContext:
     """The Run Context an operator-invoked network diagnostic runs under.
 
     ``search.query`` reaches the same in-process network path as the chat
@@ -163,7 +161,7 @@ def _operator_network_tool_context() -> ToolContext:
     # Only the fields this path consumes are set. `caller_kind` and the tool
     # allow/deny lists drive tool-list building, which an RPC never does, and a
     # plausible-looking value there would be a claim nothing checks.
-    return ToolContext(
+    context = ToolContext(
         workspace_dir=workspace,
         run_mode=RunMode.SAFE.value,
         sandbox_run_context=RunContext(
@@ -174,10 +172,18 @@ def _operator_network_tool_context() -> ToolContext:
         source_kind="rpc",
         source_name="search",
     )
+    # The persisted network policy, pinned the way turn ingress pins it. Without
+    # it `active_sandbox_policy()` finds nothing on the context and falls back to
+    # a blank `StoredSandboxPolicy`, so the deployment's own deny list and
+    # `block_all_network` would not be applied to traffic this context makes
+    # reachable — the RPC would end up with more authority than the chat tool it
+    # is being brought level with, which is the opposite of the point.
+    pin_sandbox_policy(context, ctx.config)
+    return context
 
 
 @contextmanager
-def _operator_network_context() -> Iterator[None]:
+def operator_network_context(ctx: RpcContext) -> Iterator[None]:
     """Run the block under the operator Run Context, or unchanged if it cannot be built.
 
     Failing to build the context must not fail the caller: for ``search.query``
@@ -186,9 +192,13 @@ def _operator_network_context() -> Iterator[None]:
     """
 
     try:
-        token = current_tool_context.set(_operator_network_tool_context())
-    except Exception:  # noqa: BLE001 - diagnostics degrade, they do not fail
-        log.debug("search.operator_network_context_unavailable", exc_info=True)
+        token = current_tool_context.set(_operator_network_tool_context(ctx))
+    except Exception:  # noqa: BLE001 - fail closed to the pre-fix refusal
+        # Reaching the network without the policy that governs it would be worse
+        # than not reaching it, so a context that cannot be built completely is
+        # not published at all: the block runs as it did before this fix, which
+        # is a refusal under a managed-network posture.
+        log.warning("search.operator_network_context_unavailable", exc_info=True)
         yield
         return
     try:
@@ -234,7 +244,7 @@ async def _handle_search_query(params: dict | None, ctx: RpcContext) -> dict[str
             provider=provider_name,
         )
 
-    with _operator_network_context():
+    with operator_network_context(ctx):
         payload_or_denial = await run_in_process_network_action(
             action_kind="web.fetch",
             argv=(

@@ -24,11 +24,14 @@ from opensquilla.gateway.rpc_tools import (
     _operator_network_tool_context,
 )
 from opensquilla.sandbox.config import SandboxSettings
+from opensquilla.sandbox.escalation import current_tool_run_context
 from opensquilla.sandbox.integration import (
+    active_sandbox_policy,
     configure_runtime,
     reset_runtime,
     run_in_process_network_action,
 )
+from opensquilla.sandbox.policy_store import SandboxPolicyStore
 from opensquilla.sandbox.run_context import RunContext
 from opensquilla.sandbox.run_mode import RunMode
 from opensquilla.tools.run_mode import full_host_access_active
@@ -160,13 +163,19 @@ async def test_status_reports_the_verdict_the_query_will_meet(
 async def test_the_operator_context_carries_no_grants_of_its_own(tmp_path: Path) -> None:
     """It is the carrier for a per-action grant, not a standing authorization.
 
-    If this context ever arrives with mounts, domains, or a public-network
-    grant, an operator RPC would be reaching the network on terms the chat path
-    has to ask for.
+    Asserted on `current_tool_run_context()`, the value the network decision
+    actually reads, rather than on the freshly built field: the two differ once
+    a session key is present, because `resolved_run_context_overlay` merges any
+    grants remembered for that key. Reading the field alone would keep passing
+    if this context ever gained one.
     """
     _configure("recommended", tmp_path)
 
-    context = _operator_network_tool_context().sandbox_run_context
+    token = current_tool_context.set(_operator_network_tool_context(_ctx()))
+    try:
+        context = current_tool_run_context()
+    finally:
+        current_tool_context.reset(token)
 
     assert isinstance(context, RunContext)
     assert context.mounts == ()
@@ -174,6 +183,39 @@ async def test_the_operator_context_carries_no_grants_of_its_own(tmp_path: Path)
     assert context.bundles == ()
     assert context.public_network == ()
     assert context.temporary_grants == ()
+
+
+@pytest.mark.asyncio
+async def test_the_operator_context_carries_the_deployment_network_policy(
+    tmp_path: Path,
+) -> None:
+    """The rules that decide a host, not just the run mode.
+
+    `active_sandbox_policy()` reads the persisted policy off whatever context is
+    current, and falls back to a blank `SandboxPolicy` when it finds none — a
+    blank one denies nothing. Turn ingress pins the real policy for exactly this
+    reason. Published without it, this context would carry traffic with the
+    deployment's own deny list and `block_all_network` unapplied, which is more
+    authority than the chat tool it is being brought level with, not less.
+
+    The postures above cannot catch that: none of them denies the chat tool, so
+    agreement between the two only ever proves both are allowed.
+    """
+    _configure("recommended", tmp_path)
+    state_dir = tmp_path / "state"
+    store = SandboxPolicyStore(state_dir / "sessions.db")
+    blocked = store.read()
+    blocked.network.block_all_network = True
+    store.compare_and_swap(blocked.policy_version, blocked)
+
+    ctx = SimpleNamespace(config=SimpleNamespace(state_dir=str(state_dir)))
+    token = current_tool_context.set(_operator_network_tool_context(ctx))
+    try:
+        observed = active_sandbox_policy()
+    finally:
+        current_tool_context.reset(token)
+
+    assert observed.network.block_all_network is True
 
 
 @pytest.mark.asyncio
@@ -196,7 +238,7 @@ async def test_the_operator_context_never_publishes_full_host_access(tmp_path: P
     """
     _configure("recommended", tmp_path)
 
-    context = _operator_network_tool_context()
+    context = _operator_network_tool_context(_ctx())
     assert context.run_mode == RunMode.SAFE.value
     assert context.sandbox_run_context.run_mode is RunMode.SAFE
 
@@ -207,7 +249,7 @@ async def test_the_operator_context_never_publishes_full_host_access(tmp_path: P
         current_tool_context.reset(token)
 
     _configure("sandbox-off", tmp_path)
-    full_context = _operator_network_tool_context()
+    full_context = _operator_network_tool_context(_ctx())
     assert full_context.run_mode == RunMode.SAFE.value
     assert full_context.sandbox_run_context.run_mode is RunMode.SAFE
 

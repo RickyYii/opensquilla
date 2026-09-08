@@ -111,9 +111,17 @@ async def _search_runtime_payload(
     params: dict[str, Any] | None,
     ctx: RpcContext,
 ) -> dict[str, Any]:
-    del ctx
+    from opensquilla.gateway.rpc_tools import operator_network_context
+
     provider = (params or {}).get("provider")
-    return read_search_status(str(provider) if provider else None)
+    # The same probe context `search.status` and `search.query` run under.
+    # Without it the doctor warns that search queries are blocked and points the
+    # operator at `opensquilla search status`, which reports them fine — #1202's
+    # disagreement moved between two diagnostics on one gateway.
+    return read_search_status(
+        str(provider) if provider else None,
+        probe_context=lambda: operator_network_context(ctx),
+    )
 
 
 async def _provider_payload(
