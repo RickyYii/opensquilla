@@ -18,10 +18,10 @@ from types import SimpleNamespace
 
 import pytest
 
+from opensquilla.gateway.operator_network import operator_network_tool_context
 from opensquilla.gateway.rpc_tools import (
     _handle_search_query,
     _handle_search_status,
-    _operator_network_tool_context,
 )
 from opensquilla.sandbox.config import SandboxSettings
 from opensquilla.sandbox.escalation import current_tool_run_context
@@ -171,7 +171,7 @@ async def test_the_operator_context_carries_no_grants_of_its_own(tmp_path: Path)
     """
     _configure("recommended", tmp_path)
 
-    token = current_tool_context.set(_operator_network_tool_context(_ctx()))
+    token = current_tool_context.set(operator_network_tool_context(_ctx().config))
     try:
         context = current_tool_run_context()
     finally:
@@ -209,7 +209,7 @@ async def test_the_operator_context_carries_the_deployment_network_policy(
     store.compare_and_swap(blocked.policy_version, blocked)
 
     ctx = SimpleNamespace(config=SimpleNamespace(state_dir=str(state_dir)))
-    token = current_tool_context.set(_operator_network_tool_context(ctx))
+    token = current_tool_context.set(operator_network_tool_context(ctx.config))
     try:
         observed = active_sandbox_policy()
     finally:
@@ -238,7 +238,7 @@ async def test_the_operator_context_never_publishes_full_host_access(tmp_path: P
     """
     _configure("recommended", tmp_path)
 
-    context = _operator_network_tool_context(_ctx())
+    context = operator_network_tool_context(_ctx().config)
     assert context.run_mode == RunMode.SAFE.value
     assert context.sandbox_run_context.run_mode is RunMode.SAFE
 
@@ -249,7 +249,7 @@ async def test_the_operator_context_never_publishes_full_host_access(tmp_path: P
         current_tool_context.reset(token)
 
     _configure("sandbox-off", tmp_path)
-    full_context = _operator_network_tool_context(_ctx())
+    full_context = operator_network_tool_context(_ctx().config)
     assert full_context.run_mode == RunMode.SAFE.value
     assert full_context.sandbox_run_context.run_mode is RunMode.SAFE
 

@@ -2,21 +2,14 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
-from contextlib import contextmanager
 from typing import Any, cast
 
-import structlog
-
+from opensquilla.gateway.operator_network import operator_network_context
 from opensquilla.gateway.rpc import RpcContext, get_dispatcher
 from opensquilla.gateway.search_status_runtime import read_search_status as _read_search_status
-from opensquilla.run_mode import RunMode
 from opensquilla.sandbox.integration import (
-    get_runtime,
     run_in_process_network_action,
 )
-from opensquilla.sandbox.policy_store import pin_sandbox_policy
-from opensquilla.sandbox.run_context import RunContext
 from opensquilla.sandbox.types import DenialResult
 from opensquilla.tools.builtin.web import (
     _search_plan_argv_token,
@@ -31,9 +24,6 @@ from opensquilla.tools.rpc_payload import (
     tools_catalog_payload,
     tools_effective_payload,
 )
-from opensquilla.tools.types import ToolContext, current_tool_context
-
-log = structlog.get_logger(__name__)
 
 _d = get_dispatcher()
 
@@ -125,86 +115,8 @@ async def read_search_status(params: dict | None, ctx: RpcContext) -> dict[str, 
     provider = (params or {}).get("provider")
     return _read_search_status(
         str(provider) if provider else None,
-        probe_context=lambda: operator_network_context(ctx),
+        probe_context=lambda: operator_network_context(ctx.config),
     )
-
-
-def _operator_network_tool_context(ctx: RpcContext) -> ToolContext:
-    """The Run Context an operator-invoked network diagnostic runs under.
-
-    ``search.query`` reaches the same in-process network path as the chat
-    ``web_search`` tool, but an RPC never enters tool dispatch, so nothing sets
-    ``current_tool_context`` and ``current_tool_run_context()`` returns ``None``.
-    Under ``NetworkMode.PROXY_ALLOWLIST`` that is refused before the provider is
-    reached, which is why the same gateway answers Web Chat and refuses the CLI
-    (#1202).
-
-    The context authorizes nothing by itself: no mounts, no domains, no
-    public-network grant. It is the carrier the proxy path needs —
-    :func:`run_in_process_network_action` still resolves the policy, still mints
-    one fingerprinted ``expires_after="once"`` grant per action, and still puts
-    every host through ``NetworkApprovalService``.
-
-    The run mode is pinned to Safe, and deliberately not read from the gateway
-    config. A tool context is not a description of the deployment: every guard
-    that calls ``full_host_access_active()`` reads the run mode off whatever
-    context is current, so publishing ``full`` here would stand down protections
-    that have nothing to do with the network proxy — including the
-    sensitive-payload guard that stops a query containing secrets from being
-    sent to a search provider. Safe cannot widen anything, and it does not
-    weaken the network decision either: the mode that resolves the policy comes
-    from the graded ``SecurityLevel``, not from this field.
-    """
-
-    runtime = get_runtime()
-    workspace = str(getattr(runtime, "workspace", None) or "") or None
-    # Only the fields this path consumes are set. `caller_kind` and the tool
-    # allow/deny lists drive tool-list building, which an RPC never does, and a
-    # plausible-looking value there would be a claim nothing checks.
-    context = ToolContext(
-        workspace_dir=workspace,
-        run_mode=RunMode.SAFE.value,
-        sandbox_run_context=RunContext(
-            run_mode=RunMode.SAFE,
-            workspace=workspace,
-            source="operator_rpc",
-        ),
-        source_kind="rpc",
-        source_name="search",
-    )
-    # The persisted network policy, pinned the way turn ingress pins it. Without
-    # it `active_sandbox_policy()` finds nothing on the context and falls back to
-    # a blank `StoredSandboxPolicy`, so the deployment's own deny list and
-    # `block_all_network` would not be applied to traffic this context makes
-    # reachable — the RPC would end up with more authority than the chat tool it
-    # is being brought level with, which is the opposite of the point.
-    pin_sandbox_policy(context, ctx.config)
-    return context
-
-
-@contextmanager
-def operator_network_context(ctx: RpcContext) -> Iterator[None]:
-    """Run the block under the operator Run Context, or unchanged if it cannot be built.
-
-    Failing to build the context must not fail the caller: for ``search.query``
-    the fallback is the previous refusal, and ``search.status`` is a diagnostic
-    surface that has to keep answering even when the sandbox cannot be read.
-    """
-
-    try:
-        token = current_tool_context.set(_operator_network_tool_context(ctx))
-    except Exception:  # noqa: BLE001 - fail closed to the pre-fix refusal
-        # Reaching the network without the policy that governs it would be worse
-        # than not reaching it, so a context that cannot be built completely is
-        # not published at all: the block runs as it did before this fix, which
-        # is a refusal under a managed-network posture.
-        log.warning("search.operator_network_context_unavailable", exc_info=True)
-        yield
-        return
-    try:
-        yield
-    finally:
-        current_tool_context.reset(token)
 
 
 @_d.method("search.status", scope="operator.read")
@@ -244,7 +156,7 @@ async def _handle_search_query(params: dict | None, ctx: RpcContext) -> dict[str
             provider=provider_name,
         )
 
-    with operator_network_context(ctx):
+    with operator_network_context(ctx.config):
         payload_or_denial = await run_in_process_network_action(
             action_kind="web.fetch",
             argv=(
